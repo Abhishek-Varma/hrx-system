@@ -17,6 +17,11 @@ alias(
 )
 
 alias(
+    name = "hrx-smi",
+    actual = "//runtime/src/iree/tools/hrx-smi",
+)
+
+alias(
     name = "iree-profile",
     actual = "//runtime/src/iree/tools/iree-profile",
 )

@@ -25,6 +25,7 @@ iree_cc_library(
     "device.h"
     "device_event.h"
     "device_group.h"
+    "device_report.h"
     "device_spec.h"
     "driver.h"
     "driver_registry.h"
@@ -65,6 +66,7 @@ iree_cc_library(
     "device.c"
     "device_event.c"
     "device_group.c"
+    "device_report.c"
     "device_spec.c"
     "driver.c"
     "driver_registry.c"
@@ -104,6 +106,18 @@ iree_cc_test(
     ::hal
     iree::base
     iree::hal::testing::mock_device
+    iree::testing::gtest
+    iree::testing::gtest_main
+)
+
+iree_cc_test(
+  NAME
+    device_report_test
+  SRCS
+    "device_report_test.cc"
+  DEPS
+    ::hal
+    iree::base
     iree::testing::gtest
     iree::testing::gtest_main
 )

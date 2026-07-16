@@ -1,0 +1,26 @@
+# Copyright 2026 The IREE Authors
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+load("//runtime/build_tools/bazel:cc.bzl", "iree_runtime_cc_binary")
+
+package(
+    default_visibility = ["//visibility:private"],
+    features = ["layering_check"],
+    licenses = ["notice"],  # Apache 2.0
+)
+
+# Backend-neutral: walks the HAL driver registry and reports whichever drivers
+# were linked in. Device detail is produced by each driver's dump_device_info.
+iree_runtime_cc_binary(
+    name = "hrx-smi",
+    srcs = ["hrx-smi.c"],
+    visibility = ["//tools:__pkg__"],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/hal/drivers",
+    ],
+)

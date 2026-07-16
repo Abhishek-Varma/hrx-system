@@ -44,6 +44,29 @@ IREE_API_EXPORT iree_status_t iree_hal_driver_dump_device_info(
   return status;
 }
 
+IREE_API_EXPORT bool iree_hal_driver_supports_device_report(
+    iree_hal_driver_t* driver) {
+  IREE_ASSERT_ARGUMENT(driver);
+  return _VTABLE_DISPATCH(driver, dump_device_report) != NULL;
+}
+
+IREE_API_EXPORT iree_status_t iree_hal_driver_dump_device_report(
+    iree_hal_driver_t* driver, iree_hal_device_id_t device_id,
+    iree_hal_device_report_writer_t* writer) {
+  IREE_ASSERT_ARGUMENT(driver);
+  IREE_ASSERT_ARGUMENT(writer);
+  if (_VTABLE_DISPATCH(driver, dump_device_report) == NULL) {
+    return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
+                            "driver does not provide a structured device "
+                            "report; use dump_device_info instead");
+  }
+  IREE_TRACE_ZONE_BEGIN(z0);
+  iree_status_t status =
+      _VTABLE_DISPATCH(driver, dump_device_report)(driver, device_id, writer);
+  IREE_TRACE_ZONE_END(z0);
+  return status;
+}
+
 IREE_API_EXPORT iree_status_t iree_hal_driver_create_device_by_ordinal(
     iree_hal_driver_t* driver, iree_host_size_t device_ordinal,
     iree_host_size_t param_count, const iree_string_pair_t* params,

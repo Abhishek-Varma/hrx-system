@@ -12,6 +12,7 @@
 
 #include "iree/base/api.h"
 #include "iree/hal/device.h"
+#include "iree/hal/device_report.h"
 #include "iree/hal/resource.h"
 
 #ifdef __cplusplus
@@ -85,6 +86,24 @@ IREE_API_EXPORT iree_status_t iree_hal_driver_query_available_devices(
 IREE_API_EXPORT iree_status_t iree_hal_driver_dump_device_info(
     iree_hal_driver_t* driver, iree_hal_device_id_t device_id,
     iree_string_builder_t* builder);
+
+// Returns true if the driver implements the structured device report hook.
+// When false, callers should fall back to iree_hal_driver_dump_device_info.
+IREE_API_EXPORT bool iree_hal_driver_supports_device_report(
+    iree_hal_driver_t* driver);
+
+// Writes a structured, typed description of the device with the given
+// |device_id| into |writer|. The driver appends fields into the writer's
+// current object (the caller owns opening/closing the enclosing object), so the
+// same report can be serialized as JSON or text. See iree/hal/device_report.h
+// for the recommended common/backend key convention.
+//
+// Returns IREE_STATUS_UNIMPLEMENTED if the driver does not provide a structured
+// report (use iree_hal_driver_supports_device_report to check first). As with
+// dump_device_info, returns success whether or not any fields were added.
+IREE_API_EXPORT iree_status_t iree_hal_driver_dump_device_report(
+    iree_hal_driver_t* driver, iree_hal_device_id_t device_id,
+    iree_hal_device_report_writer_t* writer);
 
 // Creates a device with the given |device_ordinal| as enumerated by
 // iree_hal_driver_query_available_devices. The ordering of devices is driver
@@ -178,6 +197,13 @@ typedef struct iree_hal_driver_vtable_t {
       const iree_string_pair_t* params,
       const iree_hal_device_create_params_t* create_params,
       iree_allocator_t host_allocator, iree_hal_device_t** out_device);
+
+  // Optional: structured device report. May be NULL; callers must null-check
+  // (via iree_hal_driver_supports_device_report) and fall back to
+  // dump_device_info. Appended into the writer's current object.
+  iree_status_t(IREE_API_PTR* dump_device_report)(
+      iree_hal_driver_t* driver, iree_hal_device_id_t device_id,
+      iree_hal_device_report_writer_t* writer);
 } iree_hal_driver_vtable_t;
 IREE_HAL_ASSERT_VTABLE_LAYOUT(iree_hal_driver_vtable_t);
 
