@@ -3697,6 +3697,29 @@ extern "C" iree_status_t iree_hal_amdxdna_native_device_c_query_caps(
   return iree_hal_amdxdna_native_device_query_caps(device, out_caps);
 }
 
+extern "C" iree_status_t iree_hal_amdxdna_native_c_enumerate_devices(
+    iree_hal_amdxdna_native_c_device_list_t* out_list) {
+  // Native discovery is not yet implemented on the Windows MCDM backend.
+  IREE_ASSERT_ARGUMENT(out_list);
+  std::memset(out_list, 0, sizeof(*out_list));
+  return iree_make_status(
+      IREE_STATUS_UNIMPLEMENTED,
+      "amdxdna device enumeration is not implemented on the "
+      "Windows MCDM backend");
+}
+
+extern "C" iree_status_t iree_hal_amdxdna_native_device_c_query_info(
+    iree_hal_amdxdna_native_device_t* device,
+    iree_hal_amdxdna_native_c_device_info_t* out_info) {
+  // Device introspection is not yet implemented on the Windows MCDM backend.
+  IREE_ASSERT_ARGUMENT(device);
+  IREE_ASSERT_ARGUMENT(out_info);
+  std::memset(out_info, 0, sizeof(*out_info));
+  return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
+                          "amdxdna device introspection is not implemented on "
+                          "the Windows MCDM backend");
+}
+
 extern "C" iree_status_t iree_hal_amdxdna_native_device_c_alloc_buffer(
     iree_hal_amdxdna_native_device_t* device, iree_device_size_t size,
     iree_hal_amdxdna_native_buffer_c_type_t type,

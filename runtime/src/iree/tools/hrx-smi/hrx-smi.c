@@ -5,10 +5,12 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 // hrx-smi: a system-management interface for HRX, modeled after `xrt-smi`. The
-// `examine` subcommand reports host configuration and then walks the HAL driver
-// registry, emitting per-driver/per-device detail (via each driver's
-// dump_device_info hook) in text or JSON. It is backend-neutral: whichever
-// drivers are linked into the binary are enumerated automatically.
+// `examine` subcommand reports host configuration and device information.
+//
+// Text output is the curated, human-readable amdxdna (NPU) report users expect
+// from an HRX SMI tool. JSON output (--format=json) is backend-neutral: it walks
+// the HAL driver registry and emits each linked driver's structured device
+// report, so it round-trips as typed data for tooling.
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -16,6 +18,7 @@
 
 #include "iree/base/api.h"
 #include "iree/hal/api.h"
+#include "iree/hal/drivers/amdxdna/examine.h"
 #include "iree/hal/drivers/init.h"
 
 #if defined(IREE_PLATFORM_LINUX) || defined(__linux__)
@@ -189,36 +192,6 @@ static iree_status_t iree_hrx_smi_append_json_string_field(
 // Host report
 //===----------------------------------------------------------------------===//
 
-static iree_status_t iree_hrx_smi_format_host_text(
-    const iree_hrx_smi_host_info_t* host, iree_string_builder_t* builder) {
-  IREE_RETURN_IF_ERROR(
-      iree_string_builder_append_cstring(builder, "System Configuration\n"));
-  IREE_RETURN_IF_ERROR(iree_string_builder_append_format(
-      builder, "  %-16s : %s\n", "Model", iree_hrx_smi_or_na(host->model)));
-  IREE_RETURN_IF_ERROR(iree_string_builder_append_format(
-      builder, "  %-16s : %s\n", "OS", iree_hrx_smi_or_na(host->distribution)));
-  IREE_RETURN_IF_ERROR(iree_string_builder_append_format(
-      builder, "  %-16s : %s %s\n", "Kernel", iree_hrx_smi_or_na(host->os_name),
-      iree_hrx_smi_or_na(host->release)));
-  IREE_RETURN_IF_ERROR(iree_string_builder_append_format(
-      builder, "  %-16s : %s\n", "Machine", iree_hrx_smi_or_na(host->machine)));
-  IREE_RETURN_IF_ERROR(
-      iree_string_builder_append_format(builder, "  %-16s : %s\n", "Processor",
-                                        iree_hrx_smi_or_na(host->processor)));
-  IREE_RETURN_IF_ERROR(iree_string_builder_append_format(
-      builder, "  %-16s : %u\n", "CPU Cores", host->cpu_cores));
-  IREE_RETURN_IF_ERROR(iree_string_builder_append_format(
-      builder, "  %-16s : %.1f GiB\n", "Memory",
-      (double)host->memory_bytes / (1024.0 * 1024.0 * 1024.0)));
-  IREE_RETURN_IF_ERROR(iree_string_builder_append_format(
-      builder, "  %-16s : %s\n", "BIOS Vendor",
-      iree_hrx_smi_or_na(host->bios_vendor)));
-  IREE_RETURN_IF_ERROR(iree_string_builder_append_format(
-      builder, "  %-16s : %s\n", "BIOS Version",
-      iree_hrx_smi_or_na(host->bios_version)));
-  return iree_ok_status();
-}
-
 static iree_status_t iree_hrx_smi_format_host_json(
     const iree_hrx_smi_host_info_t* host, iree_string_builder_t* builder) {
   IREE_RETURN_IF_ERROR(
@@ -257,94 +230,45 @@ static iree_status_t iree_hrx_smi_format_host_json(
 // Driver/device aggregation
 //===----------------------------------------------------------------------===//
 
-// Appends the detail block for a single device to |builder|. Detail is produced
-// by the driver's dump_device_info hook, so the exact contents are backend
-// specific. Failures are tolerated (reported inline) so one bad device does not
-// abort the whole report.
-static iree_status_t iree_hrx_smi_append_device_text(
-    iree_hal_driver_t* driver, const iree_hal_device_info_t* device_info,
+// Builds the curated, xrt-smi-style text report for amdxdna NPUs. The generic
+// registry is only used for the JSON output; the human-readable text view is
+// intentionally the amdxdna-focused report users expect from an HRX SMI tool.
+static iree_status_t iree_hrx_smi_format_text(
+    const iree_hrx_smi_host_info_t* host, iree_allocator_t host_allocator,
     iree_string_builder_t* builder) {
-  IREE_RETURN_IF_ERROR(iree_string_builder_append_format(
-      builder, "    [%" PRIu64 "] %.*s  (%.*s)\n",
-      (uint64_t)device_info->device_id, (int)device_info->name.size,
-      device_info->name.data, (int)device_info->path.size,
-      device_info->path.data));
+  iree_hal_amdxdna_examine_report_t report;
+  memset(&report, 0, sizeof(report));
+  // Map the collected host facts into the amdxdna report's host block.
+  snprintf(report.host.os_name, sizeof(report.host.os_name), "%s",
+           host->os_name);
+  snprintf(report.host.release, sizeof(report.host.release), "%s",
+           host->release);
+  snprintf(report.host.machine, sizeof(report.host.machine), "%s",
+           host->machine);
+  snprintf(report.host.distribution, sizeof(report.host.distribution), "%s",
+           host->distribution);
+  snprintf(report.host.model, sizeof(report.host.model), "%s", host->model);
+  snprintf(report.host.bios_vendor, sizeof(report.host.bios_vendor), "%s",
+           host->bios_vendor);
+  snprintf(report.host.bios_version, sizeof(report.host.bios_version), "%s",
+           host->bios_version);
+  snprintf(report.host.processor, sizeof(report.host.processor), "%s",
+           host->processor);
+  report.host.cpu_cores = host->cpu_cores;
+  report.host.memory_bytes = host->memory_bytes;
 
-  iree_status_t status = iree_ok_status();
-  if (iree_hal_driver_supports_device_report(driver)) {
-    // Preferred path: render the structured report as indented text.
-    iree_hal_device_report_writer_t writer;
-    iree_hal_device_report_writer_initialize(IREE_HAL_DEVICE_REPORT_FORMAT_TEXT,
-                                             /*text_indent=*/6, builder,
-                                             &writer);
-    status = iree_hal_device_report_writer_begin_object(
-        &writer, iree_string_view_empty());
-    if (iree_status_is_ok(status)) {
-      status = iree_hal_driver_dump_device_report(
-          driver, device_info->device_id, &writer);
-    }
-    if (iree_status_is_ok(status)) {
-      status = iree_hal_device_report_writer_end_object(&writer);
-    }
-    if (iree_status_is_ok(status)) {
-      status = iree_string_builder_append_cstring(builder, "\n");
-    }
-  } else {
-    // Fallback: the driver only offers the free-form text dump.
-    status = iree_hal_driver_dump_device_info(driver, device_info->device_id,
-                                              builder);
-  }
-
+  iree_status_t status =
+      iree_hal_amdxdna_examine_collect_devices(host_allocator, &report);
   if (!iree_status_is_ok(status)) {
-    const char* code = iree_status_code_string(iree_status_code(status));
-    iree_status_ignore(status);
-    IREE_RETURN_IF_ERROR(iree_string_builder_append_format(
-        builder, "      (device report failed: %s)\n", code));
-  }
-  return iree_ok_status();
-}
-
-static iree_status_t iree_hrx_smi_append_driver_text(
-    iree_hal_driver_registry_t* registry,
-    const iree_hal_driver_info_t* driver_info, iree_allocator_t host_allocator,
-    iree_string_builder_t* builder) {
-  IREE_RETURN_IF_ERROR(iree_string_builder_append_format(
-      builder, "  %.*s (%.*s)\n", (int)driver_info->driver_name.size,
-      driver_info->driver_name.data, (int)driver_info->full_name.size,
-      driver_info->full_name.data));
-
-  iree_hal_driver_t* driver = NULL;
-  iree_status_t status = iree_hal_driver_registry_try_create(
-      registry, driver_info->driver_name, host_allocator, &driver);
-  if (!iree_status_is_ok(status)) {
-    const char* code = iree_status_code_string(iree_status_code(status));
-    iree_status_ignore(status);
-    return iree_string_builder_append_format(
-        builder, "    (driver unavailable: %s)\n", code);
-  }
-
-  iree_host_size_t device_count = 0;
-  iree_hal_device_info_t* device_infos = NULL;
-  status = iree_hal_driver_query_available_devices(
-      driver, host_allocator, &device_count, &device_infos);
-  if (!iree_status_is_ok(status)) {
-    const char* code = iree_status_code_string(iree_status_code(status));
-    iree_status_ignore(status);
-    status = iree_string_builder_append_format(
-        builder, "    (device enumeration failed: %s)\n", code);
-  } else if (device_count == 0) {
-    status = iree_string_builder_append_cstring(builder, "    (no devices)\n");
-  } else {
-    for (iree_host_size_t i = 0; i < device_count; ++i) {
-      status =
-          iree_hrx_smi_append_device_text(driver, &device_infos[i], builder);
-      if (!iree_status_is_ok(status)) break;
+    // A backend/platform without native discovery still yields a host report.
+    if (iree_status_code(status) == IREE_STATUS_UNIMPLEMENTED) {
+      iree_status_ignore(status);
+      report.device_count = 0;
+    } else {
+      return status;
     }
   }
-
-  iree_allocator_free(host_allocator, device_infos);
-  iree_hal_driver_release(driver);
-  return status;
+  return iree_hal_amdxdna_examine_format_text(&report, builder);
 }
 
 static iree_status_t iree_hrx_smi_append_device_json(
@@ -450,46 +374,36 @@ static iree_status_t iree_hrx_smi_format_report(
     iree_hal_driver_registry_t* registry, const iree_hrx_smi_host_info_t* host,
     bool want_json, iree_allocator_t host_allocator,
     iree_string_builder_t* builder) {
+  // Text: curated amdxdna-focused report (no registry walk needed).
+  if (!want_json) {
+    return iree_hrx_smi_format_text(host, host_allocator, builder);
+  }
+
+  // JSON: generic, walking the whole HAL driver registry and emitting each
+  // driver's structured device report (or free-form detail fallback).
   iree_host_size_t driver_count = 0;
   iree_hal_driver_info_t* driver_infos = NULL;
   IREE_RETURN_IF_ERROR(iree_hal_driver_registry_enumerate(
       registry, host_allocator, &driver_count, &driver_infos));
 
-  iree_status_t status = iree_ok_status();
-  if (want_json) {
-    status = iree_string_builder_append_cstring(builder, "{");
-    if (iree_status_is_ok(status)) {
-      status = iree_hrx_smi_format_host_json(host, builder);
+  iree_status_t status = iree_string_builder_append_cstring(builder, "{");
+  if (iree_status_is_ok(status)) {
+    status = iree_hrx_smi_format_host_json(host, builder);
+  }
+  if (iree_status_is_ok(status)) {
+    status = iree_string_builder_append_cstring(builder, ", \"drivers\": [");
+  }
+  for (iree_host_size_t i = 0; iree_status_is_ok(status) && i < driver_count;
+       ++i) {
+    if (i != 0) {
+      status = iree_string_builder_append_cstring(builder, ", ");
+      if (!iree_status_is_ok(status)) break;
     }
-    if (iree_status_is_ok(status)) {
-      status = iree_string_builder_append_cstring(builder, ", \"drivers\": [");
-    }
-    for (iree_host_size_t i = 0; iree_status_is_ok(status) && i < driver_count;
-         ++i) {
-      if (i != 0) {
-        status = iree_string_builder_append_cstring(builder, ", ");
-        if (!iree_status_is_ok(status)) break;
-      }
-      status = iree_hrx_smi_append_driver_json(registry, &driver_infos[i],
-                                               host_allocator, builder);
-    }
-    if (iree_status_is_ok(status)) {
-      status = iree_string_builder_append_cstring(builder, "]}\n");
-    }
-  } else {
-    status = iree_hrx_smi_format_host_text(host, builder);
-    if (iree_status_is_ok(status)) {
-      status = iree_string_builder_append_cstring(builder, "\nDevices\n");
-    }
-    if (iree_status_is_ok(status) && driver_count == 0) {
-      status = iree_string_builder_append_cstring(
-          builder, "  (no drivers registered)\n");
-    }
-    for (iree_host_size_t i = 0; iree_status_is_ok(status) && i < driver_count;
-         ++i) {
-      status = iree_hrx_smi_append_driver_text(registry, &driver_infos[i],
-                                               host_allocator, builder);
-    }
+    status = iree_hrx_smi_append_driver_json(registry, &driver_infos[i],
+                                             host_allocator, builder);
+  }
+  if (iree_status_is_ok(status)) {
+    status = iree_string_builder_append_cstring(builder, "]}\n");
   }
 
   iree_allocator_free(host_allocator, driver_infos);

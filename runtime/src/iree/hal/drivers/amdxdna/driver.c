@@ -9,6 +9,8 @@
 #include <string.h>
 
 #include "iree/hal/drivers/amdxdna/api.h"
+#include "iree/hal/drivers/amdxdna/examine.h"
+#include "iree/hal/drivers/amdxdna/native.h"
 #include "iree/hal/drivers/amdxdna/util.h"
 
 #define IREE_HAL_AMDXDNA_DEVICE_ID_DEFAULT 0
@@ -220,12 +222,12 @@ static iree_status_t iree_hal_amdxdna_driver_query_available_devices(
   return iree_ok_status();
 }
 
-static iree_status_t iree_hal_amdxdna_driver_dump_device_info(
-    iree_hal_driver_t* base_driver, iree_hal_device_id_t device_id,
-    iree_string_builder_t* builder) {
-  struct iree_hal_amdxdna_driver* driver = IREE_HAL_AMDXDNA_CHECKED_VTABLE_CAST(
-      base_driver, iree_hal_amdxdna_driver_vtable,
-      struct iree_hal_amdxdna_driver);
+// Appends the driver's configured (static) parameters as a typed fallback used
+// when no live device can be opened/queried, so callers always get something
+// useful. |status_text| describes why the live device was unavailable.
+static iree_status_t iree_hal_amdxdna_driver_append_configured_report(
+    struct iree_hal_amdxdna_driver* driver, const char* status_text,
+    iree_hal_device_report_writer_t* writer) {
   const struct iree_hal_amdxdna_device_params* params =
       &driver->options.default_device_params;
   const iree_string_view_t device_path =
@@ -233,24 +235,104 @@ static iree_status_t iree_hal_amdxdna_driver_dump_device_info(
   const iree_string_view_t power_mode =
       params->power_mode.size ? params->power_mode : IREE_SV("<unchanged>");
 
+  IREE_RETURN_IF_ERROR(iree_hal_device_report_writer_begin_object(
+      writer, IREE_SV(IREE_HAL_DEVICE_REPORT_GROUP_COMMON)));
+  IREE_RETURN_IF_ERROR(
+      iree_hal_device_report_writer_cstring(writer, IREE_SV("vendor"), "AMD"));
+  IREE_RETURN_IF_ERROR(iree_hal_device_report_writer_cstring(
+      writer, IREE_SV("category"), "npu"));
+  IREE_RETURN_IF_ERROR(iree_hal_device_report_writer_end_object(writer));
+
+  IREE_RETURN_IF_ERROR(iree_hal_device_report_writer_begin_object(
+      writer, IREE_SV(IREE_HAL_DEVICE_REPORT_GROUP_BACKEND)));
+  IREE_RETURN_IF_ERROR(iree_hal_device_report_writer_cstring(
+      writer, IREE_SV("status"), status_text));
+  IREE_RETURN_IF_ERROR(iree_hal_device_report_writer_string(
+      writer, IREE_SV("device_path"), device_path));
+  IREE_RETURN_IF_ERROR(
+      iree_hal_device_report_writer_begin_object(writer, IREE_SV("core_grid")));
+  IREE_RETURN_IF_ERROR(iree_hal_device_report_writer_i64(
+      writer, IREE_SV("rows"), params->n_core_rows));
+  IREE_RETURN_IF_ERROR(iree_hal_device_report_writer_i64(
+      writer, IREE_SV("cols"), params->n_core_cols));
+  IREE_RETURN_IF_ERROR(iree_hal_device_report_writer_end_object(writer));
+  IREE_RETURN_IF_ERROR(iree_hal_device_report_writer_string(
+      writer, IREE_SV("power_mode"), power_mode));
+  return iree_hal_device_report_writer_end_object(writer);
+}
+
+// Writes the amdxdna device report into |writer|'s current object.
+// Opens/queries a live device when present; otherwise falls back to configured
+// parameters. Always returns success unless the writer itself fails.
+static iree_status_t iree_hal_amdxdna_driver_append_live_report(
+    struct iree_hal_amdxdna_driver* driver,
+    iree_hal_device_report_writer_t* writer) {
+  iree_hal_amdxdna_native_c_device_list_t list;
+  iree_status_t enum_status =
+      iree_hal_amdxdna_native_c_enumerate_devices(&list);
+  if (iree_status_is_ok(enum_status) && list.count > 0) {
+    struct iree_hal_amdxdna_device_params params =
+        driver->options.default_device_params;
+    params.device_path = iree_make_cstring_view(list.paths[0]);
+    iree_hal_amdxdna_native_device_t* device = NULL;
+    iree_status_t status = iree_hal_amdxdna_native_device_c_create(
+        &params, driver->host_allocator, &device);
+    if (iree_status_is_ok(status)) {
+      iree_hal_amdxdna_native_c_device_info_t info;
+      status = iree_hal_amdxdna_native_device_c_query_info(device, &info);
+      iree_hal_amdxdna_native_device_c_destroy(device);
+      if (iree_status_is_ok(status)) {
+        return iree_hal_amdxdna_device_info_append_report(&info, writer);
+      }
+    }
+    // A device is present but could not be opened/queried; report why but still
+    // succeed so the aggregator can continue with other drivers/devices.
+    const char* code = iree_status_code_string(iree_status_code(status));
+    iree_status_ignore(status);
+    return iree_hal_amdxdna_driver_append_configured_report(driver, code,
+                                                            writer);
+  }
+  iree_status_ignore(enum_status);
+  return iree_hal_amdxdna_driver_append_configured_report(
+      driver, "no device bound", writer);
+}
+
+static iree_status_t iree_hal_amdxdna_driver_dump_device_report(
+    iree_hal_driver_t* base_driver, iree_hal_device_id_t device_id,
+    iree_hal_device_report_writer_t* writer) {
+  struct iree_hal_amdxdna_driver* driver = IREE_HAL_AMDXDNA_CHECKED_VTABLE_CAST(
+      base_driver, iree_hal_amdxdna_driver_vtable,
+      struct iree_hal_amdxdna_driver);
   if (device_id != IREE_HAL_AMDXDNA_DEVICE_ID_DEFAULT) {
     return iree_make_status(IREE_STATUS_NOT_FOUND,
                             "no amdxdna device with id %" PRIu64,
                             (uint64_t)device_id);
   }
+  return iree_hal_amdxdna_driver_append_live_report(driver, writer);
+}
 
-  IREE_RETURN_IF_ERROR(iree_string_builder_append_format(
-      builder, "\n- Driver: %.*s\n", (int)driver->identifier.size,
-      driver->identifier.data));
-  IREE_RETURN_IF_ERROR(iree_string_builder_append_format(
-      builder, "  device_path: %.*s\n", (int)device_path.size,
-      device_path.data));
-  IREE_RETURN_IF_ERROR(iree_string_builder_append_format(
-      builder, "  core_grid: %dx%d\n", params->n_core_rows,
-      params->n_core_cols));
-  IREE_RETURN_IF_ERROR(iree_string_builder_append_format(
-      builder, "  power_mode: %.*s\n", (int)power_mode.size, power_mode.data));
-  return iree_ok_status();
+// Legacy free-form text hook, derived from the structured report so there is a
+// single source of truth for both formats.
+static iree_status_t iree_hal_amdxdna_driver_dump_device_info(
+    iree_hal_driver_t* base_driver, iree_hal_device_id_t device_id,
+    iree_string_builder_t* builder) {
+  struct iree_hal_amdxdna_driver* driver = IREE_HAL_AMDXDNA_CHECKED_VTABLE_CAST(
+      base_driver, iree_hal_amdxdna_driver_vtable,
+      struct iree_hal_amdxdna_driver);
+  if (device_id != IREE_HAL_AMDXDNA_DEVICE_ID_DEFAULT) {
+    return iree_make_status(IREE_STATUS_NOT_FOUND,
+                            "no amdxdna device with id %" PRIu64,
+                            (uint64_t)device_id);
+  }
+  iree_hal_device_report_writer_t writer;
+  iree_hal_device_report_writer_initialize(IREE_HAL_DEVICE_REPORT_FORMAT_TEXT,
+                                           /*text_indent=*/0, builder, &writer);
+  IREE_RETURN_IF_ERROR(iree_hal_device_report_writer_begin_object(
+      &writer, iree_string_view_empty()));
+  IREE_RETURN_IF_ERROR(
+      iree_hal_amdxdna_driver_append_live_report(driver, &writer));
+  IREE_RETURN_IF_ERROR(iree_hal_device_report_writer_end_object(&writer));
+  return iree_string_builder_append_cstring(builder, "\n");
 }
 
 static iree_status_t iree_hal_amdxdna_driver_create_device_by_id(
@@ -311,4 +393,5 @@ static const iree_hal_driver_vtable_t iree_hal_amdxdna_driver_vtable = {
     .dump_device_info = iree_hal_amdxdna_driver_dump_device_info,
     .create_device_by_id = iree_hal_amdxdna_driver_create_device_by_id,
     .create_device_by_path = iree_hal_amdxdna_driver_create_device_by_path,
+    .dump_device_report = iree_hal_amdxdna_driver_dump_device_report,
 };

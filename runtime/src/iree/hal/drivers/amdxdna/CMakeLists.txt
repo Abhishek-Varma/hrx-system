@@ -73,6 +73,7 @@ iree_cc_library(
     "direct_command_buffer_planning.h"
     "direct_command_buffer_single_cache.h"
     "event.h"
+    "examine.h"
     "executable.h"
     "executable_internal.h"
     "native.h"
@@ -94,6 +95,7 @@ iree_cc_library(
     "direct_command_buffer_single_cache.c"
     "driver.c"
     "event.c"
+    "examine.c"
     "executable.c"
     "nop_executable_cache.c"
     "semaphore.c"
@@ -306,6 +308,24 @@ iree_cc_test(
   DEPS
     ::amdxdna
     iree::base
+    iree::testing::gtest
+    iree::testing::gtest_main
+  LABELS
+    "driver=amdxdna"
+    "iree-build-requirement=runtime.hal.amdxdna"
+)
+endif()
+
+if(IREE_HAL_DRIVER_AMDXDNA AND (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Windows"))
+iree_cc_test(
+  NAME
+    examine_test
+  SRCS
+    "examine_test.cc"
+  DEPS
+    ::amdxdna
+    iree::base
+    iree::hal
     iree::testing::gtest
     iree::testing::gtest_main
   LABELS

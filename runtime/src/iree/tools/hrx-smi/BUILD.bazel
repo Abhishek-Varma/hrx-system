@@ -12,15 +12,24 @@ package(
     licenses = ["notice"],  # Apache 2.0
 )
 
-# Backend-neutral: walks the HAL driver registry and reports whichever drivers
-# were linked in. Device detail is produced by each driver's dump_device_info.
+# The curated text report is amdxdna-focused (and the amdxdna driver only builds
+# on Linux and Windows), so hrx-smi follows suit. JSON output still walks the
+# generic HAL driver registry for whichever drivers are linked in.
+_HRX_SMI_COMPATIBLE_WITH = select({
+    "@platforms//os:linux": [],
+    "@platforms//os:windows": [],
+    "//conditions:default": ["@platforms//:incompatible"],
+})
+
 iree_runtime_cc_binary(
     name = "hrx-smi",
     srcs = ["hrx-smi.c"],
+    target_compatible_with = _HRX_SMI_COMPATIBLE_WITH,
     visibility = ["//tools:__pkg__"],
     deps = [
         "//runtime/src/iree/base",
         "//runtime/src/iree/hal",
         "//runtime/src/iree/hal/drivers",
+        "//runtime/src/iree/hal/drivers/amdxdna",
     ],
 )

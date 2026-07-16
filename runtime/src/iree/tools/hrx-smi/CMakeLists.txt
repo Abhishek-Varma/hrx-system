@@ -9,6 +9,7 @@
 
 iree_add_all_subdirs()
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Windows")
 iree_cc_binary(
   NAME
     hrx-smi
@@ -18,6 +19,8 @@ iree_cc_binary(
     iree::base
     iree::hal
     iree::hal::drivers
+    iree::hal::drivers::amdxdna
 )
+endif()
 
 ### BAZEL_TO_CMAKE_PRESERVES_ALL_CONTENT_BELOW_THIS_LINE ###

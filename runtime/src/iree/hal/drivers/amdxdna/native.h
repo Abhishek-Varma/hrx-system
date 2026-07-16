@@ -140,6 +140,125 @@ iree_status_t iree_hal_amdxdna_native_device_c_query_caps(
     iree_hal_amdxdna_native_device_t* device,
     iree_hal_amdxdna_native_c_device_caps_t* out_caps);
 
+//===----------------------------------------------------------------------===//
+// Device introspection ("examine")
+//
+// OS-neutral, read-only device information used by reporting tools. All fields
+// are plain data with fixed capacities so the DDI needs no cross-boundary
+// allocation. Per-section |has_*| flags distinguish "queried and absent/zero"
+// from "query unsupported by this driver/firmware/platform": a backend that
+// cannot answer a section leaves its flag false and its fields zeroed rather
+// than failing the whole call.
+//===----------------------------------------------------------------------===//
+
+#define IREE_HAL_AMDXDNA_NATIVE_C_MAX_CLOCKS 4
+#define IREE_HAL_AMDXDNA_NATIVE_C_MAX_SENSORS 16
+#define IREE_HAL_AMDXDNA_NATIVE_C_MAX_CONTEXTS 32
+#define IREE_HAL_AMDXDNA_NATIVE_C_MAX_DEVICES 8
+#define IREE_HAL_AMDXDNA_NATIVE_C_MAX_PATH 64
+#define IREE_HAL_AMDXDNA_NATIVE_C_LABEL_SIZE 64
+#define IREE_HAL_AMDXDNA_NATIVE_C_UNITS_SIZE 16
+
+typedef struct iree_hal_amdxdna_native_c_clock_t {
+  char name[IREE_HAL_AMDXDNA_NATIVE_C_UNITS_SIZE];
+  uint32_t freq_mhz;
+} iree_hal_amdxdna_native_c_clock_t;
+
+// A single hardware sensor reading. The physical value is
+// |value * pow(10, scale_exponent)| expressed in |units|.
+typedef struct iree_hal_amdxdna_native_c_sensor_t {
+  char label[IREE_HAL_AMDXDNA_NATIVE_C_LABEL_SIZE];
+  char units[IREE_HAL_AMDXDNA_NATIVE_C_UNITS_SIZE];
+  uint32_t value;
+  uint32_t max;
+  uint32_t average;
+  int8_t scale_exponent;
+  uint8_t type;
+} iree_hal_amdxdna_native_c_sensor_t;
+
+// Per-tile-kind geometry of the AIE array.
+typedef struct iree_hal_amdxdna_native_c_aie_tile_t {
+  uint16_t row_count;
+  uint16_t row_start;
+} iree_hal_amdxdna_native_c_aie_tile_t;
+
+// Utilization/health counters for one active hardware context.
+typedef struct iree_hal_amdxdna_native_c_context_stats_t {
+  uint32_t context_id;
+  uint32_t start_col;
+  uint32_t num_col;
+  int64_t pid;
+  uint64_t command_submissions;
+  uint64_t command_completions;
+  uint64_t migrations;
+  uint64_t preemptions;
+  uint64_t errors;
+} iree_hal_amdxdna_native_c_context_stats_t;
+
+typedef struct iree_hal_amdxdna_native_c_device_info_t {
+  // Identity (from sysfs; empty string when unavailable).
+  char arch[IREE_HAL_AMDXDNA_NATIVE_C_UNITS_SIZE * 2];
+  char bdf[IREE_HAL_AMDXDNA_NATIVE_C_UNITS_SIZE * 2];
+  char driver_version[IREE_HAL_AMDXDNA_NATIVE_C_LABEL_SIZE];
+
+  bool has_firmware_version;
+  uint32_t firmware_major;
+  uint32_t firmware_minor;
+  uint32_t firmware_patch;
+  uint32_t firmware_build;
+
+  bool has_aie_version;
+  uint32_t aie_major;
+  uint32_t aie_minor;
+
+  bool has_aie_metadata;
+  uint32_t aie_col_size;
+  uint16_t aie_cols;
+  uint16_t aie_rows;
+  iree_hal_amdxdna_native_c_aie_tile_t aie_core;
+  iree_hal_amdxdna_native_c_aie_tile_t aie_mem;
+  iree_hal_amdxdna_native_c_aie_tile_t aie_shim;
+
+  bool has_power_mode;
+  iree_hal_amdxdna_native_c_power_mode_t power_mode;
+
+  uint32_t clock_count;
+  iree_hal_amdxdna_native_c_clock_t
+      clocks[IREE_HAL_AMDXDNA_NATIVE_C_MAX_CLOCKS];
+
+  uint32_t sensor_count;
+  iree_hal_amdxdna_native_c_sensor_t
+      sensors[IREE_HAL_AMDXDNA_NATIVE_C_MAX_SENSORS];
+
+  // Total number of active contexts the driver reported (may exceed
+  // |context_count| if there are more than the fixed capacity; the array holds
+  // the first |context_count|).
+  uint32_t context_total;
+  uint32_t context_count;
+  iree_hal_amdxdna_native_c_context_stats_t
+      contexts[IREE_HAL_AMDXDNA_NATIVE_C_MAX_CONTEXTS];
+} iree_hal_amdxdna_native_c_device_info_t;
+
+typedef struct iree_hal_amdxdna_native_c_device_list_t {
+  iree_host_size_t count;
+  char paths[IREE_HAL_AMDXDNA_NATIVE_C_MAX_DEVICES]
+            [IREE_HAL_AMDXDNA_NATIVE_C_MAX_PATH];
+} iree_hal_amdxdna_native_c_device_list_t;
+
+// Enumerates the native accelerator device nodes present on the system. Returns
+// IREE_STATUS_UNIMPLEMENTED on platforms without native discovery support. A
+// system with no NPU present returns OK with |count| == 0.
+iree_status_t iree_hal_amdxdna_native_c_enumerate_devices(
+    iree_hal_amdxdna_native_c_device_list_t* out_list);
+
+// Gathers read-only introspection data for an already-open native device.
+// Individual sections that the driver/firmware does not support are left with
+// their |has_*| flag false rather than failing the whole call. Returns
+// IREE_STATUS_UNIMPLEMENTED on platforms without introspection support.
+iree_status_t iree_hal_amdxdna_native_device_c_query_info(
+    iree_hal_amdxdna_native_device_t* device,
+    iree_hal_amdxdna_native_c_device_info_t* out_info);
+
 iree_status_t iree_hal_amdxdna_native_device_c_alloc_buffer(
     iree_hal_amdxdna_native_device_t* device, iree_device_size_t size,
     iree_hal_amdxdna_native_buffer_c_type_t type,

@@ -483,8 +483,92 @@ int device::set_power_mode(power_mode mode) const {
   return 0;
 }
 
+namespace {
+
+// Issues a fixed-size DRM_AMDXDNA_QUERY_* GET_INFO ioctl into |out_struct|.
+template <typename T>
+int query_fixed_info(const pdev& pdev, uint32_t param, T* out_struct) {
+  amdxdna_drm_get_info arg = {
+      .param = param,
+      .buffer_size = static_cast<uint32_t>(sizeof(*out_struct)),
+      .buffer = reinterpret_cast<uintptr_t>(out_struct)};
+  return pdev.try_ioctl(DRM_IOCTL_AMDXDNA_GET_INFO, &arg);
+}
+
+// Issues a variable-length DRM_AMDXDNA_QUERY_* GET_INFO ioctl that returns an
+// array of |T| records. The kernel reports the number of bytes it needs/wrote
+// back through |buffer_size|, so this starts from |initial_capacity| records
+// and grows the buffer exactly once if that was insufficient.
+template <typename T>
+int query_array_info(const pdev& pdev, uint32_t param, size_t initial_capacity,
+                     std::vector<T>* out) {
+  out->clear();
+  size_t capacity = initial_capacity == 0 ? 1 : initial_capacity;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    std::vector<T> buffer(capacity);
+    const uint32_t byte_capacity =
+        static_cast<uint32_t>(buffer.size() * sizeof(T));
+    amdxdna_drm_get_info arg = {
+        .param = param,
+        .buffer_size = byte_capacity,
+        .buffer = reinterpret_cast<uintptr_t>(buffer.data())};
+    int err = pdev.try_ioctl(DRM_IOCTL_AMDXDNA_GET_INFO, &arg);
+    if (err) return err;
+    const uint32_t needed = arg.buffer_size;
+    if (needed > byte_capacity) {
+      // Round up to whole records and retry once with the driver-reported size.
+      capacity = (needed + sizeof(T) - 1) / sizeof(T);
+      continue;
+    }
+    buffer.resize(needed / sizeof(T));
+    *out = std::move(buffer);
+    return 0;
+  }
+  return ENOSPC;
+}
+
+}  // namespace
+
+int device::get_firmware_version(
+    amdxdna_drm_query_firmware_version* out) const {
+  return query_fixed_info(m_pdev, DRM_AMDXDNA_QUERY_FIRMWARE_VERSION, out);
+}
+
+int device::get_aie_version(amdxdna_drm_query_aie_version* out) const {
+  return query_fixed_info(m_pdev, DRM_AMDXDNA_QUERY_AIE_VERSION, out);
+}
+
+int device::get_aie_metadata(amdxdna_drm_query_aie_metadata* out) const {
+  return query_fixed_info(m_pdev, DRM_AMDXDNA_QUERY_AIE_METADATA, out);
+}
+
+int device::get_clock_metadata(amdxdna_drm_query_clock_metadata* out) const {
+  return query_fixed_info(m_pdev, DRM_AMDXDNA_QUERY_CLOCK_METADATA, out);
+}
+
+int device::get_power_sensors(
+    std::vector<amdxdna_drm_query_sensor>* out) const {
+  return query_array_info(m_pdev, DRM_AMDXDNA_QUERY_SENSORS,
+                          /*initial_capacity=*/8, out);
+}
+
+int device::get_hwctx_stats(std::vector<amdxdna_drm_query_hwctx>* out) const {
+  return query_array_info(m_pdev, DRM_AMDXDNA_QUERY_HW_CONTEXTS,
+                          /*initial_capacity=*/32, out);
+}
+
 std::string read_sysfs(const std::string& filename) {
   return read_first_line(filename);
+}
+
+std::string query_pci_bdf() {
+  const std::filesystem::path npu_device = try_find_npu_device();
+  if (npu_device.empty()) return {};
+  return npu_device.filename().string();
+}
+
+std::string query_driver_version() {
+  return read_first_line("/sys/module/amdxdna/version");
 }
 
 std::string stringify_power_mode(power_mode mode) {

@@ -434,6 +434,188 @@ iree_status_t iree_hal_amdxdna_native_device_query_caps(
   return iree_ok_status();
 }
 
+namespace {
+
+void copy_to_fixed(char* dst, size_t dst_size, const std::string& src) {
+  if (dst_size == 0) return;
+  const size_t n = std::min(src.size(), dst_size - 1);
+  if (n != 0) std::memcpy(dst, src.data(), n);
+  dst[n] = '\0';
+}
+
+void copy_to_fixed(char* dst, size_t dst_size, const char* src,
+                   size_t src_capacity) {
+  // |src| is a fixed-width, possibly non-NUL-terminated kernel field.
+  size_t src_len = 0;
+  while (src_len < src_capacity && src[src_len] != '\0') ++src_len;
+  copy_to_fixed(dst, dst_size, std::string(src, src_len));
+}
+
+iree_hal_amdxdna_native_c_power_mode_t from_shim_power_mode(
+    shim_xdna::power_mode mode) {
+  switch (mode) {
+    case shim_xdna::power_mode::default_mode:
+      return IREE_HAL_AMDXDNA_NATIVE_C_POWER_MODE_DEFAULT;
+    case shim_xdna::power_mode::low:
+      return IREE_HAL_AMDXDNA_NATIVE_C_POWER_MODE_LOW;
+    case shim_xdna::power_mode::medium:
+      return IREE_HAL_AMDXDNA_NATIVE_C_POWER_MODE_MEDIUM;
+    case shim_xdna::power_mode::high:
+      return IREE_HAL_AMDXDNA_NATIVE_C_POWER_MODE_HIGH;
+    case shim_xdna::power_mode::turbo:
+      return IREE_HAL_AMDXDNA_NATIVE_C_POWER_MODE_TURBO;
+  }
+  return IREE_HAL_AMDXDNA_NATIVE_C_POWER_MODE_DEFAULT;
+}
+
+}  // namespace
+
+iree_status_t iree_hal_amdxdna_native_enumerate_devices(
+    iree_hal_amdxdna_native_c_device_list_t* out_list) {
+  IREE_ASSERT_ARGUMENT(out_list);
+  std::memset(out_list, 0, sizeof(*out_list));
+
+  const std::filesystem::path accel_dir = "/dev/accel";
+  std::error_code ec;
+  std::vector<std::string> candidates;
+  for (std::filesystem::directory_iterator it(accel_dir, ec), end;
+       !ec && it != end; it.increment(ec)) {
+    const std::string filename = it->path().filename().string();
+    if (filename.rfind("accel", 0) == 0) {
+      candidates.push_back(it->path().string());
+    }
+  }
+  // A missing /dev/accel directory simply means no NPU is present; that is a
+  // successful enumeration with zero devices, not an error.
+  std::sort(candidates.begin(), candidates.end());
+
+  iree_host_size_t count = 0;
+  for (const std::string& path : candidates) {
+    if (count >= IREE_HAL_AMDXDNA_NATIVE_C_MAX_DEVICES) break;
+    if (path.size() >= IREE_HAL_AMDXDNA_NATIVE_C_MAX_PATH) continue;
+    copy_to_fixed(out_list->paths[count], IREE_HAL_AMDXDNA_NATIVE_C_MAX_PATH,
+                  path);
+    ++count;
+  }
+  out_list->count = count;
+  return iree_ok_status();
+}
+
+iree_status_t iree_hal_amdxdna_native_device_query_info(
+    iree_hal_amdxdna_native_device_t* device,
+    iree_hal_amdxdna_native_c_device_info_t* out_info) {
+  IREE_ASSERT_ARGUMENT(device);
+  IREE_ASSERT_ARGUMENT(out_info);
+  std::memset(out_info, 0, sizeof(*out_info));
+  const shim_xdna::device& shim = *device->shim_device;
+
+  // Identity from sysfs. These are best-effort and shared across the (single)
+  // NPU on current hardware; absence yields empty strings.
+  copy_to_fixed(out_info->arch, sizeof(out_info->arch),
+                shim_xdna::query_npu_arch());
+  copy_to_fixed(out_info->bdf, sizeof(out_info->bdf),
+                shim_xdna::query_pci_bdf());
+  copy_to_fixed(out_info->driver_version, sizeof(out_info->driver_version),
+                shim_xdna::query_driver_version());
+
+  // Each section degrades independently: a query the driver/firmware cannot
+  // answer leaves its |has_*| flag false without failing the whole call.
+  amdxdna_drm_query_firmware_version fw{};
+  if (shim.get_firmware_version(&fw) == 0) {
+    out_info->has_firmware_version = true;
+    out_info->firmware_major = fw.major;
+    out_info->firmware_minor = fw.minor;
+    out_info->firmware_patch = fw.patch;
+    out_info->firmware_build = fw.build;
+  }
+
+  amdxdna_drm_query_aie_version aie_version{};
+  if (shim.get_aie_version(&aie_version) == 0) {
+    out_info->has_aie_version = true;
+    out_info->aie_major = aie_version.major;
+    out_info->aie_minor = aie_version.minor;
+  }
+
+  amdxdna_drm_query_aie_metadata aie_metadata{};
+  if (shim.get_aie_metadata(&aie_metadata) == 0) {
+    out_info->has_aie_metadata = true;
+    out_info->aie_col_size = aie_metadata.col_size;
+    out_info->aie_cols = aie_metadata.cols;
+    out_info->aie_rows = aie_metadata.rows;
+    out_info->aie_core = {aie_metadata.core.row_count,
+                          aie_metadata.core.row_start};
+    out_info->aie_mem = {aie_metadata.mem.row_count,
+                         aie_metadata.mem.row_start};
+    out_info->aie_shim = {aie_metadata.shim.row_count,
+                          aie_metadata.shim.row_start};
+  }
+
+  shim_xdna::power_mode mode = shim_xdna::power_mode::default_mode;
+  if (shim.get_power_mode(&mode) == 0) {
+    out_info->has_power_mode = true;
+    out_info->power_mode = from_shim_power_mode(mode);
+  }
+
+  amdxdna_drm_query_clock_metadata clocks{};
+  if (shim.get_clock_metadata(&clocks) == 0) {
+    const amdxdna_drm_query_clock* sources[] = {&clocks.mp_npu_clock,
+                                                &clocks.h_clock};
+    for (const amdxdna_drm_query_clock* clock : sources) {
+      if (out_info->clock_count >= IREE_HAL_AMDXDNA_NATIVE_C_MAX_CLOCKS) break;
+      iree_hal_amdxdna_native_c_clock_t& dst =
+          out_info->clocks[out_info->clock_count++];
+      copy_to_fixed(dst.name, sizeof(dst.name),
+                    reinterpret_cast<const char*>(clock->name),
+                    sizeof(clock->name));
+      dst.freq_mhz = clock->freq_mhz;
+    }
+  }
+
+  std::vector<amdxdna_drm_query_sensor> sensors;
+  if (shim.get_power_sensors(&sensors) == 0) {
+    for (const amdxdna_drm_query_sensor& sensor : sensors) {
+      if (out_info->sensor_count >= IREE_HAL_AMDXDNA_NATIVE_C_MAX_SENSORS)
+        break;
+      iree_hal_amdxdna_native_c_sensor_t& dst =
+          out_info->sensors[out_info->sensor_count++];
+      copy_to_fixed(dst.label, sizeof(dst.label),
+                    reinterpret_cast<const char*>(sensor.label),
+                    sizeof(sensor.label));
+      copy_to_fixed(dst.units, sizeof(dst.units),
+                    reinterpret_cast<const char*>(sensor.units),
+                    sizeof(sensor.units));
+      dst.value = sensor.input;
+      dst.max = sensor.max;
+      dst.average = sensor.average;
+      dst.scale_exponent = sensor.unitm;
+      dst.type = sensor.type;
+    }
+  }
+
+  std::vector<amdxdna_drm_query_hwctx> contexts;
+  if (shim.get_hwctx_stats(&contexts) == 0) {
+    out_info->context_total = static_cast<uint32_t>(contexts.size());
+    for (const amdxdna_drm_query_hwctx& ctx : contexts) {
+      if (out_info->context_count >= IREE_HAL_AMDXDNA_NATIVE_C_MAX_CONTEXTS) {
+        break;
+      }
+      iree_hal_amdxdna_native_c_context_stats_t& dst =
+          out_info->contexts[out_info->context_count++];
+      dst.context_id = ctx.context_id;
+      dst.start_col = ctx.start_col;
+      dst.num_col = ctx.num_col;
+      dst.pid = ctx.pid;
+      dst.command_submissions = ctx.command_submissions;
+      dst.command_completions = ctx.command_completions;
+      dst.migrations = ctx.migrations;
+      dst.preemptions = ctx.preemptions;
+      dst.errors = ctx.errors;
+    }
+  }
+
+  return iree_ok_status();
+}
+
 iree_status_t iree_hal_amdxdna_native_device_alloc_buffer(
     iree_hal_amdxdna_native_device_t* device, iree_device_size_t size,
     iree_hal_amdxdna_native_buffer_c_type_t type,
@@ -1160,6 +1342,17 @@ extern "C" iree_status_t iree_hal_amdxdna_native_device_c_query_caps(
     iree_hal_amdxdna_native_device_t* device,
     iree_hal_amdxdna_native_c_device_caps_t* out_caps) {
   return iree_hal_amdxdna_native_device_query_caps(device, out_caps);
+}
+
+extern "C" iree_status_t iree_hal_amdxdna_native_c_enumerate_devices(
+    iree_hal_amdxdna_native_c_device_list_t* out_list) {
+  return iree_hal_amdxdna_native_enumerate_devices(out_list);
+}
+
+extern "C" iree_status_t iree_hal_amdxdna_native_device_c_query_info(
+    iree_hal_amdxdna_native_device_t* device,
+    iree_hal_amdxdna_native_c_device_info_t* out_info) {
+  return iree_hal_amdxdna_native_device_query_info(device, out_info);
 }
 
 extern "C" iree_status_t iree_hal_amdxdna_native_device_c_alloc_buffer(

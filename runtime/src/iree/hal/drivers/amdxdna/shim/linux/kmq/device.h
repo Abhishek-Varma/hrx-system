@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "amdxdna_accel.h"
 #include "bo_flags.h"
 #include "fence.h"
 
@@ -97,6 +98,19 @@ struct device {
   // Returns 0 on success or the errno from DRM_IOCTL_AMDXDNA_SET_STATE.
   int set_power_mode(power_mode mode) const;
 
+  // Read-only device introspection used by reporting tools (e.g. examine).
+  // Each returns 0 on success or the failing errno from the GET_INFO ioctl.
+  // Fixed-size queries write directly into the caller-provided struct.
+  int get_firmware_version(amdxdna_drm_query_firmware_version* out) const;
+  int get_aie_version(amdxdna_drm_query_aie_version* out) const;
+  int get_aie_metadata(amdxdna_drm_query_aie_metadata* out) const;
+  int get_clock_metadata(amdxdna_drm_query_clock_metadata* out) const;
+  // Variable-length queries: the kernel reports the number of bytes it wrote
+  // back through the ioctl, so these grow the buffer once if it was too small
+  // and return the exact number of records the driver provided.
+  int get_power_sensors(std::vector<amdxdna_drm_query_sensor>* out) const;
+  int get_hwctx_stats(std::vector<amdxdna_drm_query_hwctx>* out) const;
+
   int create_fence(fence_handle::access_mode,
                    std::unique_ptr<fence_handle>* out_fence);
   int import_fence(pid_t, int, std::unique_ptr<fence_handle>* out_fence);
@@ -106,6 +120,13 @@ std::filesystem::path find_default_accel_device_path();
 // Returns the NPU architecture name ("Phoenix"/"Strix") read from the device's
 // sysfs vbnv, or an empty string if no NPU is found. Does not open the device.
 std::string query_npu_arch();
+// Returns the PCI Bus:Device.Function string (e.g. "0000:c5:00.1") of the
+// amdxdna NPU from sysfs, or an empty string if no NPU is found. Does not open
+// the device.
+std::string query_pci_bdf();
+// Returns the amdxdna kernel module version string from sysfs
+// (/sys/module/amdxdna/version), or an empty string if unavailable.
+std::string query_driver_version();
 // Resolves 0 rows/cols to hardware defaults without constructing a device.
 // Returns 0 on success or an errno-style value on open/ioctl/metadata failure.
 int resolve_core_grid_size(const std::filesystem::path& device_path,
