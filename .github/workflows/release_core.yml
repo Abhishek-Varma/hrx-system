@@ -4,7 +4,7 @@
 # See https://llvm.org/LICENSE.txt for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-name: Release CMake Linux Core
+name: Release CMake Core
 
 on:
   push:
@@ -43,41 +43,86 @@ jobs:
       sanitizer: none
       test_gpu: false
       ctest_label_exclude_regex: "runtime-resource=|manual"
+      # amdxdna HAL must be ON so the released runtime can drive the NPU;
+      # without it hrx loads but silently no-ops on amdxdna executables.
       cmake_options: |
+        -DIREE_HAL_DRIVER_AMDXDNA=ON
         -DIREE_HAL_AMDGPU_TARGETS=gfx942;gfx1151;gfx1201
+      package: true
+      package_suffix: ${{ github.ref_name }}
+
+  build_core_windows:
+    name: CMake Windows Release
+    needs: validate_tag
+    uses: ./.github/workflows/build_core_windows.yml
+    permissions:
+      contents: read
+    with:
+      name: Release
+      windows_toolchain: msvc
+      release_type: nightly
+      artifact_set: core
+      build_type: RelWithDebInfo
+      # amdxdna HAL must be ON so hrx.dll can drive the NPU on Windows.
+      cmake_options: |
+        -DIREE_HAL_DRIVER_AMDXDNA=ON
       package: true
       package_suffix: ${{ github.ref_name }}
 
   publish_release:
     name: Publish release
-    needs: build_core_linux
+    needs: [build_core_linux, build_core_windows]
     runs-on: ubuntu-24.04
     permissions:
       actions: read
       contents: write
     steps:
-      - name: Download public package artifact
+      - name: Download public package artifact (linux)
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: hrx-public-linux-x86_64
           path: release-assets
 
-      - name: Download public dependency package artifact
+      - name: Download public dependency package artifact (linux)
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: hrx-public-deps-linux-x86_64
           path: release-assets
 
-      - name: Download test package artifact
+      - name: Download test package artifact (linux)
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: hrx-tests-linux-x86_64
           path: release-assets
 
-      - name: Download ROCm build environment package artifact
+      - name: Download ROCm build environment package artifact (linux)
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: hrx-rocm-buildenv-linux-x86_64
+          path: release-assets
+
+      - name: Download public package artifact (windows)
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: hrx-public-windows-msvc-x86_64
+          path: release-assets
+
+      - name: Download public dependency package artifact (windows)
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: hrx-public-deps-windows-msvc-x86_64
+          path: release-assets
+
+      - name: Download test package artifact (windows)
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: hrx-tests-windows-msvc-x86_64
+          path: release-assets
+
+      - name: Download ROCm build environment package artifact (windows)
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: hrx-rocm-buildenv-windows-msvc-x86_64
           path: release-assets
 
       - name: Validate release assets
@@ -95,6 +140,20 @@ jobs:
             "hrx-rocm-buildenv-linux-x86_64-${tag}.tar.zst"
             "hrx-rocm-buildenv-linux-x86_64-${tag}.manifest.json"
             "hrx-rocm-buildenv-linux-x86_64-env.sh"
+            "hrx-public-windows-x86_64-${tag}.zip"
+            "hrx-public-windows-x86_64-${tag}.manifest.json"
+            "hrx-public-windows-x86_64-env.cmd"
+            "hrx-public-windows-x86_64-env.ps1"
+            "hrx-public-deps-windows-x86_64-${tag}.zip"
+            "hrx-public-deps-windows-x86_64-${tag}.manifest.json"
+            "hrx-public-deps-windows-x86_64-env.cmd"
+            "hrx-public-deps-windows-x86_64-env.ps1"
+            "hrx-tests-windows-x86_64-${tag}.zip"
+            "hrx-tests-windows-x86_64-${tag}.manifest.json"
+            "hrx-rocm-buildenv-windows-x86_64-${tag}.zip"
+            "hrx-rocm-buildenv-windows-x86_64-${tag}.manifest.json"
+            "hrx-rocm-buildenv-windows-x86_64-env.cmd"
+            "hrx-rocm-buildenv-windows-x86_64-env.ps1"
           )
 
           missing=0
@@ -111,6 +170,15 @@ jobs:
           fi
 
           ls -lh release-assets
+
+      - name: Compute SHA256 checksums
+        run: |
+          cd release-assets
+          sha256sum \
+            hrx-public-linux-x86_64-*.tar.zst \
+            hrx-public-windows-x86_64-*.zip \
+            > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - name: Publish GitHub release
         env:

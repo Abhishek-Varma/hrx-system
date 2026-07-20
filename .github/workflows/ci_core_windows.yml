@@ -49,12 +49,16 @@ jobs:
             assertions: false
             run_tests: true
             ctest_exclude_regex: ""
+            cmake_options: |
+              -DIREE_HAL_DRIVER_AMDXDNA=ON
             package: true
           - variant: windows-clang-cl
             toolchain: clang-cl
             assertions: true
             run_tests: true
             ctest_exclude_regex: ""
+            cmake_options: |
+              -DIREE_HAL_DRIVER_AMDXDNA=ON
             package: false
     uses: ./.github/workflows/build_core_windows.yml
     permissions:
@@ -70,6 +74,7 @@ jobs:
       run_tests: ${{ matrix.run_tests }}
       ctest_exclude_regex: ${{ matrix.ctest_exclude_regex }}
       ctest_label_exclude_regex: "runtime-resource=|manual"
+      cmake_options: ${{ matrix.cmake_options }}
       package: ${{ matrix.package }}
 
   summary:
