@@ -152,6 +152,8 @@ iree_runtime_cc_library(
         "asan_state.h",
         "driver.c",
         "driver.h",
+        "examine.c",
+        "examine.h",
         "executable.c",
         "executable.h",
         "executable_cache.c",
@@ -307,6 +309,7 @@ iree_runtime_cc_library(
         "asan_state.h",
         "buffer.h",
         "driver.h",
+        "examine.h",
         "executable.h",
         "executable_cache.h",
         "feedback_state.h",
@@ -395,6 +398,19 @@ iree_runtime_cc_test(
     srcs = ["access_policy_test.cc"],
     deps = [
         ":access_policy",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/testing:gtest",
+        "//runtime/src/iree/testing:gtest_main",
+    ],
+)
+
+iree_runtime_cc_test(
+    name = "examine_test",
+    srcs = ["examine_test.cc"],
+    deps = [
+        ":amdgpu",
+        ":headers",
         "//runtime/src/iree/base",
         "//runtime/src/iree/hal",
         "//runtime/src/iree/testing:gtest",

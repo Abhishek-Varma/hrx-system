@@ -8,6 +8,7 @@
 
 #include "iree/base/internal/debugging.h"
 #include "iree/hal/drivers/amdgpu/api.h"
+#include "iree/hal/drivers/amdgpu/examine.h"
 #include "iree/hal/drivers/amdgpu/logical_device.h"
 
 //===----------------------------------------------------------------------===//
@@ -432,24 +433,86 @@ static iree_status_t iree_hal_amdgpu_driver_query_available_devices(
   return status;
 }
 
+// Maps a device_id bitfield (as enumerated by query_available_devices) to the
+// GPU ordinal whose report should be emitted. The default device (all visible
+// GPUs) and single-GPU ids both resolve to the lead GPU; multi-GPU masks report
+// the first selected GPU. Returns the ordinal of the lowest set bit, or 0 for
+// the default id.
+static iree_host_size_t iree_hal_amdgpu_device_id_lead_ordinal(
+    iree_hal_device_id_t device_id) {
+  uint64_t mask = (uint64_t)device_id;
+  if (mask == 0) return 0;
+  iree_host_size_t ordinal = 0;
+  while ((mask & 1ull) == 0) {
+    mask >>= 1;
+    ++ordinal;
+  }
+  return ordinal;
+}
+
+// Writes the amdgpu device report for |device_id| into |writer|'s current
+// object. Enumerates the visible GPUs and renders the resolved lead GPU;
+// always succeeds unless the writer itself fails so aggregators can continue.
+static iree_status_t iree_hal_amdgpu_driver_append_report_for_device_id(
+    iree_hal_amdgpu_driver_t* driver, iree_hal_device_id_t device_id,
+    iree_hal_device_report_writer_t* writer) {
+  const iree_host_size_t ordinal =
+      iree_hal_amdgpu_device_id_lead_ordinal(device_id);
+
+  iree_hal_amdgpu_examine_report_t report;
+  memset(&report, 0, sizeof(report));
+  iree_status_t status = iree_hal_amdgpu_examine_collect_devices(
+      driver->host_allocator, &report);
+  if (iree_status_is_ok(status) && ordinal < report.device_count &&
+      report.devices[ordinal].info_valid) {
+    return iree_hal_amdgpu_device_info_append_report(
+        &report.devices[ordinal].info, writer);
+  }
+
+  // No live GPU could be queried; emit a minimal identity so callers still get
+  // a well-formed report rather than an error.
+  const char* status_text = iree_status_is_ok(status)
+                                ? "no gpu device available"
+                                : iree_status_code_string(
+                                      iree_status_code(status));
+  iree_status_ignore(status);
+  IREE_RETURN_IF_ERROR(iree_hal_device_report_writer_begin_object(
+      writer, IREE_SV(IREE_HAL_DEVICE_REPORT_GROUP_COMMON)));
+  IREE_RETURN_IF_ERROR(
+      iree_hal_device_report_writer_cstring(writer, IREE_SV("vendor"), "AMD"));
+  IREE_RETURN_IF_ERROR(iree_hal_device_report_writer_cstring(
+      writer, IREE_SV("category"), "gpu"));
+  IREE_RETURN_IF_ERROR(iree_hal_device_report_writer_end_object(writer));
+  IREE_RETURN_IF_ERROR(iree_hal_device_report_writer_begin_object(
+      writer, IREE_SV(IREE_HAL_DEVICE_REPORT_GROUP_BACKEND)));
+  IREE_RETURN_IF_ERROR(iree_hal_device_report_writer_cstring(
+      writer, IREE_SV("status"), status_text));
+  return iree_hal_device_report_writer_end_object(writer);
+}
+
+static iree_status_t iree_hal_amdgpu_driver_dump_device_report(
+    iree_hal_driver_t* base_driver, iree_hal_device_id_t device_id,
+    iree_hal_device_report_writer_t* writer) {
+  iree_hal_amdgpu_driver_t* driver = iree_hal_amdgpu_driver_cast(base_driver);
+  return iree_hal_amdgpu_driver_append_report_for_device_id(driver, device_id,
+                                                            writer);
+}
+
+// Legacy free-form text hook, derived from the structured report so there is a
+// single source of truth for both formats.
 static iree_status_t iree_hal_amdgpu_driver_dump_device_info(
     iree_hal_driver_t* base_driver, iree_hal_device_id_t device_id,
     iree_string_builder_t* builder) {
   iree_hal_amdgpu_driver_t* driver = iree_hal_amdgpu_driver_cast(base_driver);
-
-  // TODO(benvanik): include list of available device library archs and indicate
-  // which was selected. Could just have a string builder method in
-  // device_library.h for something like `[amdgcn-blah-blah,
-  // **amdgcn-blah-blah**, ...]`.
-
-  // TODO(benvanik): query everything like rocminfo (so we don't have to ship
-  // it).
-  (void)driver;
-
-  IREE_RETURN_IF_ERROR(
-      iree_string_builder_append_string(builder, IREE_SV("\n")));
-
-  return iree_ok_status();
+  iree_hal_device_report_writer_t writer;
+  iree_hal_device_report_writer_initialize(IREE_HAL_DEVICE_REPORT_FORMAT_TEXT,
+                                           /*text_indent=*/0, builder, &writer);
+  IREE_RETURN_IF_ERROR(iree_hal_device_report_writer_begin_object(
+      &writer, iree_string_view_empty()));
+  IREE_RETURN_IF_ERROR(iree_hal_amdgpu_driver_append_report_for_device_id(
+      driver, device_id, &writer));
+  IREE_RETURN_IF_ERROR(iree_hal_device_report_writer_end_object(&writer));
+  return iree_string_builder_append_cstring(builder, "\n");
 }
 
 static iree_status_t iree_hal_amdgpu_driver_create_device_by_id(
@@ -566,4 +629,5 @@ static const iree_hal_driver_vtable_t iree_hal_amdgpu_driver_vtable = {
     .dump_device_info = iree_hal_amdgpu_driver_dump_device_info,
     .create_device_by_id = iree_hal_amdgpu_driver_create_device_by_id,
     .create_device_by_path = iree_hal_amdgpu_driver_create_device_by_path,
+    .dump_device_report = iree_hal_amdgpu_driver_dump_device_report,
 };

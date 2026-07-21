@@ -189,6 +189,8 @@ iree_cc_library(
     "asan_state.h"
     "driver.c"
     "driver.h"
+    "examine.c"
+    "examine.h"
     "executable.c"
     "executable.h"
     "executable_cache.c"
@@ -341,6 +343,7 @@ iree_cc_library(
     "asan_state.h"
     "buffer.h"
     "driver.h"
+    "examine.h"
     "executable.h"
     "executable_cache.h"
     "feedback_state.h"
@@ -451,6 +454,24 @@ iree_cc_test(
     "runtime-resource=amd-gpu"
   RESOURCE_GROUP
     iree-hal-drivers-amdgpu-tests
+)
+endif()
+
+if(IREE_HAL_DRIVER_AMDGPU)
+iree_cc_test(
+  NAME
+    examine_test
+  SRCS
+    "examine_test.cc"
+  DEPS
+    ::amdgpu
+    ::headers
+    iree::base
+    iree::hal
+    iree::testing::gtest
+    iree::testing::gtest_main
+  LABELS
+    "iree-build-requirement=runtime.hal.amdgpu"
 )
 endif()
 

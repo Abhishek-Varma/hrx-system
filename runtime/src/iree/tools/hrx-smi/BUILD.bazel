@@ -12,9 +12,13 @@ package(
     licenses = ["notice"],  # Apache 2.0
 )
 
-# The curated text report is amdxdna-focused (and the amdxdna driver only builds
-# on Linux and Windows), so hrx-smi follows suit. JSON output still walks the
-# generic HAL driver registry for whichever drivers are linked in.
+# The curated text report is per-backend (rocm-smi-style for amdgpu, xrt-smi-
+# style for amdxdna) and both drivers only build on Linux and Windows, so
+# hrx-smi follows suit. The HRX_SMI_HAVE_* defines gate the curated code paths
+# to whichever drivers are linked in; JSON output still walks the generic HAL
+# driver registry for whatever is registered. The CMake build links these
+# drivers conditionally (see CMakeLists.txt) so hrx-smi builds even with no
+# accelerator driver enabled.
 _HRX_SMI_COMPATIBLE_WITH = select({
     "@platforms//os:linux": [],
     "@platforms//os:windows": [],
@@ -24,12 +28,17 @@ _HRX_SMI_COMPATIBLE_WITH = select({
 iree_runtime_cc_binary(
     name = "hrx-smi",
     srcs = ["hrx-smi.c"],
+    defines = [
+        "HRX_SMI_HAVE_AMDGPU=1",
+        "HRX_SMI_HAVE_AMDXDNA=1",
+    ],
     target_compatible_with = _HRX_SMI_COMPATIBLE_WITH,
     visibility = ["//tools:__pkg__"],
     deps = [
         "//runtime/src/iree/base",
         "//runtime/src/iree/hal",
         "//runtime/src/iree/hal/drivers",
+        "//runtime/src/iree/hal/drivers/amdgpu",
         "//runtime/src/iree/hal/drivers/amdxdna",
     ],
 )

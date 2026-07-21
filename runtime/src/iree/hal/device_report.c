@@ -26,26 +26,31 @@ static iree_status_t iree_hal_device_report_append_json_escaped(
   for (iree_host_size_t i = 0; i < value.size; ++i) {
     const unsigned char c = (unsigned char)value.data[i];
     switch (c) {
-      case '\"':
+      case '\"': {
         IREE_RETURN_IF_ERROR(
             iree_string_builder_append_cstring(builder, "\\\""));
         break;
-      case '\\':
+      }
+      case '\\': {
         IREE_RETURN_IF_ERROR(
             iree_string_builder_append_cstring(builder, "\\\\"));
         break;
-      case '\n':
+      }
+      case '\n': {
         IREE_RETURN_IF_ERROR(
             iree_string_builder_append_cstring(builder, "\\n"));
         break;
-      case '\r':
+      }
+      case '\r': {
         IREE_RETURN_IF_ERROR(
             iree_string_builder_append_cstring(builder, "\\r"));
         break;
-      case '\t':
+      }
+      case '\t': {
         IREE_RETURN_IF_ERROR(
             iree_string_builder_append_cstring(builder, "\\t"));
         break;
+      }
       default:
         if (c < 0x20) {
           IREE_RETURN_IF_ERROR(
