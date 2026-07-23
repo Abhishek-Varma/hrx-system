@@ -8,11 +8,33 @@
 
 #include <string.h>
 
-// AIE-visible DDR address offset added to every shim-DMA buffer address.
+// AIE-visible DDR address offset added to a shim-DMA buffer address.
 // Validated for npu4 / AIE2P_STRIX_B0 (the only target the chained path is
 // enabled for); other AIE generations may use a different offset / BD address
 // layout. This is an AIE DMA address ABI, not a native queue command window.
 static const uint64_t iree_hal_amdxdna_ddr_aie_addr_offset = 0x80000000ULL;
+
+// The amdxdna firmware pre-translates only the first N host-buffer addresses
+// into the AIE DDR aperture (i.e. adds iree_hal_amdxdna_ddr_aie_addr_offset to
+// them). Host arguments beyond that keep their raw address, and the MLIR-AIE
+// compiler folds the same aperture offset into the DDR patch's arg_plus for
+// them (see AIETargetNPU.cpp: kNumFirmwareTranslatedArgs / foldDDRAddrOffset,
+// which must stay in sync with this value). Because this native path patches
+// every BD address itself, it has to mirror the firmware exactly: add the
+// aperture offset only for the first kNumFirmwareTranslatedArgs args. Adding it
+// unconditionally would translate every arg >= N twice (the compiler already
+// folded the offset in), landing shim DMAs at host+2*offset and silently
+// dropping those transfers -- which zeroed the 6th+ host buffer.
+static const uint32_t iree_hal_amdxdna_num_firmware_translated_args = 5;
+
+// AIE DDR aperture offset to add for host argument `arg_idx`: the fixed
+// aperture offset for a firmware-pre-translated arg, or 0 for a later arg
+// (whose aperture offset the compiler already folded into its arg_plus).
+static uint64_t iree_hal_amdxdna_arg_aie_addr_offset(uint32_t arg_idx) {
+  return arg_idx < iree_hal_amdxdna_num_firmware_translated_args
+             ? iree_hal_amdxdna_ddr_aie_addr_offset
+             : 0;
+}
 // AIEC RTP lowering emits amdaie.npu.write32 values tagged with this sentinel;
 // the HAL replaces the low bits with the corresponding dispatch constant before
 // handing the transaction to firmware.
@@ -345,7 +367,8 @@ bool iree_hal_amdxdna_apply_patch_table(uint32_t* ctrl_code, size_t ctrl_words,
     uint32_t bd1 = iree_hal_amdxdna_read_u32(b + offset + 4);
     uint32_t bd2 = iree_hal_amdxdna_read_u32(b + offset + 8);
     uint64_t base = ((uint64_t)(bd2 & 0xFFFF) << 32) | bd1;
-    base += args[arg_idx] + arg_plus + iree_hal_amdxdna_ddr_aie_addr_offset;
+    base += args[arg_idx] + arg_plus +
+            iree_hal_amdxdna_arg_aie_addr_offset(arg_idx);
     bd1 = (uint32_t)(base & 0xFFFFFFFC);
     bd2 = (bd2 & 0xFFFF0000) | (uint32_t)(base >> 32);
     iree_hal_amdxdna_write_u32(b + offset + 4, bd1);
@@ -438,7 +461,8 @@ iree_status_t iree_hal_amdxdna_patch_dynamic_fields_from_template(
     const uint32_t template_bd2 =
         iree_hal_amdxdna_read_u32(template_bytes + offset + 8);
     uint64_t base = ((uint64_t)(template_bd2 & 0xFFFF) << 32) | template_bd1;
-    base += args[arg_idx] + arg_plus + iree_hal_amdxdna_ddr_aie_addr_offset;
+    base += args[arg_idx] + arg_plus +
+            iree_hal_amdxdna_arg_aie_addr_offset(arg_idx);
     const uint32_t bd1 = (uint32_t)(base & 0xFFFFFFFC);
     const uint32_t bd2 = (template_bd2 & 0xFFFF0000) | (uint32_t)(base >> 32);
     iree_hal_amdxdna_write_u32(dst_bytes + offset + 4, bd1);

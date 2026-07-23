@@ -355,6 +355,32 @@ TEST(ApplyPatchTableTest, DropsLowTwoBitsOfDescriptorAddress) {
   EXPECT_EQ(ctrl[2], static_cast<uint32_t>(base >> 32));
 }
 
+TEST(ApplyPatchTableTest, AddsAieApertureOffsetOnlyForFirmwareTranslatedArgs) {
+  // The firmware pre-translates only the first 5 host args (adds the AIE DDR
+  // aperture offset); the MLIR-AIE compiler folds the same offset into arg_plus
+  // for args >= 5 (see AIETargetNPU.cpp foldDDRAddrOffset). Patching must add
+  // the aperture offset for args < 5 and NOT for args >= 5, or the 6th+ buffer
+  // would be translated twice and its shim DMA would land out of range.
+  // Two descriptors: arg 4 (last firmware-translated) and arg 5 (folded).
+  std::vector<uint32_t> ctrl(8, 0);  // bd A at byte 0, bd B at byte 16.
+  std::vector<uint32_t> patches = {/*offset=*/0u, /*arg_idx=*/4u,
+                                   /*arg_plus=*/0u,
+                                   /*offset=*/16u, /*arg_idx=*/5u,
+                                   /*arg_plus=*/kDdrAieAddrOffset};
+  uint64_t args[] = {0u, 0u, 0u, 0u, 0x1000u, 0x2000u};
+  EXPECT_TRUE(iree_hal_amdxdna_apply_patch_table(
+      ctrl.data(), ctrl.size(), patches.data(), patches.size(), args, 6));
+  // arg 4: offset added once by the patcher.
+  const uint64_t base4 = 0x1000u + 0u + kDdrAieAddrOffset;
+  EXPECT_EQ(ctrl[1], static_cast<uint32_t>(base4 & 0xFFFFFFFC));
+  EXPECT_EQ(ctrl[2], static_cast<uint32_t>(base4 >> 32));
+  // arg 5: patcher must NOT add the offset (already folded into arg_plus), so
+  // the net offset is exactly one aperture offset, not two.
+  const uint64_t base5 = 0x2000u + kDdrAieAddrOffset;
+  EXPECT_EQ(ctrl[5], static_cast<uint32_t>(base5 & 0xFFFFFFFC));
+  EXPECT_EQ(ctrl[6], static_cast<uint32_t>(base5 >> 32));
+}
+
 // --- iree_hal_amdxdna_patch_dynamic_fields_from_template ---------------------
 
 TEST(PatchDynamicFieldsFromTemplateTest, RewritesConstantsAndPatchTable) {
@@ -438,6 +464,32 @@ TEST(PatchDynamicFieldsFromTemplateTest, RepeatedRewriteUsesTemplateBase) {
   const uint64_t expected = 0x40u + 0x2000u + kDdrAieAddrOffset;
   EXPECT_EQ(ctrl[1], static_cast<uint32_t>(expected & 0xFFFFFFFC));
   EXPECT_EQ(ctrl[2], static_cast<uint32_t>(expected >> 32));
+}
+
+TEST(PatchDynamicFieldsFromTemplateTest,
+     AddsAieApertureOffsetOnlyForFirmwareTranslatedArgs) {
+  // Same firmware-translation boundary as the apply_patch_table test, via the
+  // template path: arg < 5 gets the aperture offset added; arg >= 5 does not
+  // (the compiler already folded it into arg_plus).
+  std::vector<uint32_t> templ(8, 0);
+  std::vector<uint32_t> ctrl = templ;
+  std::vector<uint32_t> patches = {/*offset=*/0u, /*arg_idx=*/4u,
+                                   /*arg_plus=*/0u,
+                                   /*offset=*/16u, /*arg_idx=*/5u,
+                                   /*arg_plus=*/kDdrAieAddrOffset};
+  uint64_t args[] = {0u, 0u, 0u, 0u, 0x1000u, 0x2000u};
+
+  IREE_ASSERT_OK(iree_hal_amdxdna_patch_dynamic_fields_from_template(
+      ctrl.data(), templ.data(), ctrl.size(), /*constant_patches=*/nullptr,
+      iree_make_const_byte_span(nullptr, 0), patches.data(), patches.size(),
+      args, 6));
+
+  const uint64_t base4 = 0x1000u + kDdrAieAddrOffset;
+  EXPECT_EQ(ctrl[1], static_cast<uint32_t>(base4 & 0xFFFFFFFC));
+  EXPECT_EQ(ctrl[2], static_cast<uint32_t>(base4 >> 32));
+  const uint64_t base5 = 0x2000u + kDdrAieAddrOffset;  // one offset, not two
+  EXPECT_EQ(ctrl[5], static_cast<uint32_t>(base5 & 0xFFFFFFFC));
+  EXPECT_EQ(ctrl[6], static_cast<uint32_t>(base5 >> 32));
 }
 
 TEST(PatchDynamicFieldsFromTemplateTest, RejectsMalformedPatchTable) {
