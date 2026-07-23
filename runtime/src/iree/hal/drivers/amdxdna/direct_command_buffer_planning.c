@@ -364,12 +364,18 @@ bool iree_hal_amdxdna_apply_patch_table(uint32_t* ctrl_code, size_t ctrl_words,
     if ((size_t)offset + 12 > total || (offset & 0x3u) != 0) {
       return false;
     }
-    uint32_t bd1 = iree_hal_amdxdna_read_u32(b + offset + 4);
     uint32_t bd2 = iree_hal_amdxdna_read_u32(b + offset + 8);
-    uint64_t base = ((uint64_t)(bd2 & 0xFFFF) << 32) | bd1;
-    base += args[arg_idx] + arg_plus +
-            iree_hal_amdxdna_arg_aie_addr_offset(arg_idx);
-    bd1 = (uint32_t)(base & 0xFFFFFFFC);
+    // The MLIR-AIE compiler bakes the intra-buffer byte offset into the BD
+    // address word (bd[1]/bd[2] low 16 bits) AND emits that same offset as the
+    // DDR_PATCH addend (arg_plus). Firmware/XRT overwrite the BD address with
+    // buffer_base + arg_plus, so we compute the final address from scratch
+    // rather than adding to the baked-in offset. Adding to the baked value
+    // would double-count every sub-buffer BD (landing it at
+    // buffer_base + 2*offset) and silently drop its shim DMA transfer.
+    // bd[2] bits [31:16] carry BD control state and must be preserved.
+    uint64_t base = args[arg_idx] + arg_plus +
+                    iree_hal_amdxdna_arg_aie_addr_offset(arg_idx);
+    uint32_t bd1 = (uint32_t)(base & 0xFFFFFFFC);
     bd2 = (bd2 & 0xFFFF0000) | (uint32_t)(base >> 32);
     iree_hal_amdxdna_write_u32(b + offset + 4, bd1);
     iree_hal_amdxdna_write_u32(b + offset + 8, bd2);
@@ -456,13 +462,15 @@ iree_status_t iree_hal_amdxdna_patch_dynamic_fields_from_template(
           "amdxdna host patch offset %u is out of bounds or misaligned",
           offset);
     }
-    const uint32_t template_bd1 =
-        iree_hal_amdxdna_read_u32(template_bytes + offset + 4);
     const uint32_t template_bd2 =
         iree_hal_amdxdna_read_u32(template_bytes + offset + 8);
-    uint64_t base = ((uint64_t)(template_bd2 & 0xFFFF) << 32) | template_bd1;
-    base += args[arg_idx] + arg_plus +
-            iree_hal_amdxdna_arg_aie_addr_offset(arg_idx);
+    // Overwrite (do not accumulate onto) the compiler-baked BD address: the
+    // intra-buffer offset lives in both the template address word and the
+    // DDR_PATCH addend (arg_plus), so adding it to the baked value would
+    // double-count it. See iree_hal_amdxdna_apply_patch_table for details.
+    // bd[2] bits [31:16] carry BD control state and must be preserved.
+    uint64_t base = args[arg_idx] + arg_plus +
+                    iree_hal_amdxdna_arg_aie_addr_offset(arg_idx);
     const uint32_t bd1 = (uint32_t)(base & 0xFFFFFFFC);
     const uint32_t bd2 = (template_bd2 & 0xFFFF0000) | (uint32_t)(base >> 32);
     iree_hal_amdxdna_write_u32(dst_bytes + offset + 4, bd1);
