@@ -54,6 +54,137 @@ Fn ResolveKmtProc(const char* name) {
   return nullptr;
 }
 
+// --- lightweight KMT hot-path profiler --------------------------------------
+// Enabled by setting env HRX_KMT_PROFILE to a non-"0" value. If the value looks
+// like a path (contains \\ / . :) a cumulative summary is appended there at
+// process teardown; a summary is always also written to stderr. Attributes
+// per-category wall time to the raw D3DKMT calls issued per NPU dispatch so we
+// can see how much of a decode/prefill token is host submit/cache overhead vs
+// the actual firmware compute wait. Timing is guarded so it is a no-op unless
+// explicitly enabled.
+struct KmtProfCat {
+  std::atomic<uint64_t> calls{0};
+  std::atomic<uint64_t> ticks{0};
+};
+struct KmtProf {
+  KmtProfCat invalidate;  // D3DKMTInvalidateCache (SyncBuffer)
+  KmtProfCat submit;      // D3DKMTSubmitCommandToHwQueue
+  KmtProfCat wait_cpu;    // D3DKMTWaitForSynchronizationObjectFromCpu (fence)
+  KmtProfCat resident;    // WaitForBufferResidency GPU wait
+  // Per-call-site invalidate counts (count only) to locate the dominant source.
+  std::atomic<uint64_t> inv_completion{0};  // completion ring/exec read-back
+  std::atomic<uint64_t> inv_io{0};          // per-dispatch buffer host<->device
+  std::atomic<uint64_t> inv_other{0};       // aperture / setup
+  std::atomic<int> state{0};  // 0=unchecked, 1=disabled, 2=enabled
+  char out_path[512] = {0};
+};
+KmtProf g_kmt_prof;
+
+bool KmtProfEnabled() {
+  int st = g_kmt_prof.state.load(std::memory_order_acquire);
+  if (st == 0) {
+    char buf[512];
+    DWORD n = GetEnvironmentVariableA("HRX_KMT_PROFILE", buf, sizeof(buf));
+    int next = 1;
+    if (n > 0 && n < sizeof(buf) && buf[0] != '0') {
+      next = 2;
+      if (std::strpbrk(buf, "\\/.:")) {
+        std::snprintf(g_kmt_prof.out_path, sizeof(g_kmt_prof.out_path), "%s",
+                      buf);
+      }
+    }
+    g_kmt_prof.state.store(next, std::memory_order_release);
+    st = next;
+  }
+  return st == 2;
+}
+
+inline uint64_t KmtQpc() {
+  LARGE_INTEGER c;
+  QueryPerformanceCounter(&c);
+  return static_cast<uint64_t>(c.QuadPart);
+}
+
+struct KmtScopedTimer {
+  KmtProfCat* cat;
+  uint64_t t0;
+  bool on;
+  explicit KmtScopedTimer(KmtProfCat& c) : cat(&c), on(KmtProfEnabled()) {
+    if (on) t0 = KmtQpc();
+  }
+  ~KmtScopedTimer() {
+    if (!on) return;
+    cat->ticks.fetch_add(KmtQpc() - t0, std::memory_order_relaxed);
+    cat->calls.fetch_add(1, std::memory_order_relaxed);
+  }
+};
+
+// Optional: replace the per-invalidate D3DKMTInvalidateCache *syscall* with a
+// userspace cache-line flush over the mapped range, mirroring the Linux shim's
+// clflush_data() for non-coherent memory. On Windows MCDM the read-back path
+// issues one InvalidateCache kernel call per host buffer map-for-read (~170/token
+// for some models), which dominates wall time; a userspace CLFLUSH achieves the
+// same CPU-cache invalidation without the user->kernel transition. Gated by env
+// HRX_CLFLUSH_INVALIDATE so it can be A/B tested and left off by default.
+bool KmtUseClflushInvalidate() {
+  static int cached = -1;
+  if (cached < 0) {
+    char b[8];
+    DWORD n = GetEnvironmentVariableA("HRX_CLFLUSH_INVALIDATE", b, sizeof(b));
+    cached = (n > 0 && n < sizeof(b) && b[0] != '0') ? 1 : 0;
+  }
+  return cached == 1;
+}
+
+void ClflushRange(const void* base, uint64_t length) {
+  if (!base || !length) return;
+  constexpr uintptr_t kLine = 64;  // x86-64 cache line
+  uintptr_t start = reinterpret_cast<uintptr_t>(base) & ~(kLine - 1);
+  uintptr_t end = reinterpret_cast<uintptr_t>(base) + length;
+  _mm_mfence();
+  for (uintptr_t p = start; p < end; p += kLine) {
+    _mm_clflush(reinterpret_cast<const void*>(p));
+  }
+  _mm_mfence();
+}
+
+struct KmtProfDumper {
+  ~KmtProfDumper() {
+    if (!KmtProfEnabled()) return;
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    const double ms = 1000.0 / static_cast<double>(f.QuadPart);
+    auto c = [](KmtProfCat& x) { return x.calls.load(std::memory_order_relaxed); };
+    auto t = [](KmtProfCat& x) { return x.ticks.load(std::memory_order_relaxed); };
+    char buf[1024];
+    std::snprintf(
+        buf, sizeof(buf),
+        "\n[hrx][KMT-PROFILE] "
+        "invalidate=%llu calls/%.1f ms | "
+        "submit=%llu calls/%.1f ms | "
+        "wait_cpu_fence=%llu calls/%.1f ms | "
+        "resident_gpu=%llu calls/%.1f ms | "
+        "invalidate_sites[completion=%llu io=%llu other=%llu]\n",
+        (unsigned long long)c(g_kmt_prof.invalidate), t(g_kmt_prof.invalidate) * ms,
+        (unsigned long long)c(g_kmt_prof.submit), t(g_kmt_prof.submit) * ms,
+        (unsigned long long)c(g_kmt_prof.wait_cpu), t(g_kmt_prof.wait_cpu) * ms,
+        (unsigned long long)c(g_kmt_prof.resident), t(g_kmt_prof.resident) * ms,
+        (unsigned long long)g_kmt_prof.inv_completion.load(std::memory_order_relaxed),
+        (unsigned long long)g_kmt_prof.inv_io.load(std::memory_order_relaxed),
+        (unsigned long long)g_kmt_prof.inv_other.load(std::memory_order_relaxed));
+    std::fputs(buf, stderr);
+    std::fflush(stderr);
+    if (g_kmt_prof.out_path[0]) {
+      FILE* fp = std::fopen(g_kmt_prof.out_path, "a");
+      if (fp) {
+        std::fputs(buf, fp);
+        std::fclose(fp);
+      }
+    }
+  }
+};
+KmtProfDumper g_kmt_prof_dumper;
+
 void SetError(Error* out_error, const char* message) {
   if (!out_error) return;
   std::snprintf(out_error->message, sizeof(out_error->message), "%s",
@@ -848,7 +979,11 @@ bool SubmitCommandToHwQueueAfterPaging(
     D3DKMT_SUBMITCOMMANDTOHWQUEUE* submit, const char* label,
     Error* out_error) {
   if (!WaitForPendingPagingBeforeSubmit(api, device, out_error)) return false;
-  const NTSTATUS status = api.submit_command_to_hw_queue(submit);
+  NTSTATUS status;
+  {
+    KmtScopedTimer timer(g_kmt_prof.submit);
+    status = api.submit_command_to_hw_queue(submit);
+  }
   return CheckStatus(label, status, out_error);
 }
 
@@ -960,13 +1095,34 @@ bool PublishBufferCpuWrites(const Buffer& buffer, uint64_t offset,
 
 bool SyncBuffer(const KmtApi& api, const Device& device, const Buffer& buffer,
                 uint64_t offset, uint64_t length, Error* out_error) {
+  // Fast path: invalidate the CPU cache lines directly (no kernel transition),
+  // matching the Linux shim's clflush_data() for non-coherent host memory.
+  if (KmtUseClflushInvalidate() && buffer.cpu_ptr && length &&
+      offset + length <= buffer.size) {
+    KmtScopedTimer timer(g_kmt_prof.invalidate);
+    ClflushRange(static_cast<const uint8_t*>(buffer.cpu_ptr) + offset, length);
+    return true;
+  }
   D3DKMT_INVALIDATECACHE invalidate = {};
   invalidate.hDevice = device.device;
   invalidate.hAllocation = buffer.allocation;
   invalidate.Offset = offset;
   invalidate.Length = length;
-  NTSTATUS status = api.invalidate_cache(&invalidate);
+  NTSTATUS status;
+  {
+    KmtScopedTimer timer(g_kmt_prof.invalidate);
+    status = api.invalidate_cache(&invalidate);
+  }
   return CheckStatus("D3DKMTInvalidateCache", status, out_error);
+}
+
+void KmtProfCountInvalidate(int site) {
+  if (!KmtProfEnabled()) return;
+  switch (site) {
+    case 0: g_kmt_prof.inv_completion.fetch_add(1, std::memory_order_relaxed); break;
+    case 1: g_kmt_prof.inv_io.fetch_add(1, std::memory_order_relaxed); break;
+    default: g_kmt_prof.inv_other.fetch_add(1, std::memory_order_relaxed); break;
+  }
 }
 
 bool LockCommandApertureGpuAfterBootstrap(const KmtApi& api,
@@ -986,6 +1142,7 @@ bool SyncCommandApertureCode(const KmtApi& api, const Device& device,
   invalidate.hAllocation = aperture.gpu_allocation;
   invalidate.Offset = offset;
   invalidate.Length = length;
+  KmtProfCountInvalidate(2);
   NTSTATUS status = api.invalidate_cache(&invalidate);
   return CheckStatus("D3DKMTInvalidateCache(command aperture code)", status,
                      out_error);
@@ -1108,7 +1265,11 @@ bool WaitForBufferResidency(const KmtApi& api, const Device& device,
   wait.ObjectCount = 1;
   wait.ObjectHandleArray = wait_objects;
   wait.MonitoredFenceValueArray = wait_values;
-  NTSTATUS status = api.wait_from_gpu(&wait);
+  NTSTATUS status;
+  {
+    KmtScopedTimer timer(g_kmt_prof.resident);
+    status = api.wait_from_gpu(&wait);
+  }
   char call_name[160] = "D3DKMTWaitForSynchronizationObjectFromGpu";
   if (label && label[0]) {
     std::snprintf(call_name, sizeof(call_name),
@@ -1676,7 +1837,11 @@ bool WaitForHwQueueFenceCpu(const KmtApi& api, const Device& device,
   // hAsyncEvent=0 and blocks in KMT. Match that call shape instead of using an
   // asynchronous event plus a host-side wait wrapper.
   wait.hAsyncEvent = nullptr;
-  NTSTATUS status = api.wait_from_cpu(&wait);
+  NTSTATUS status;
+  {
+    KmtScopedTimer timer(g_kmt_prof.wait_cpu);
+    status = api.wait_from_cpu(&wait);
+  }
   return CheckStatus(label, status, out_error);
 }
 
@@ -2144,6 +2309,7 @@ bool SubmitAndWaitPathBImpl(const KmtApi& api, const Device& device,
   uint32_t packet_state = volatile_packet_header ? *volatile_packet_header : 0;
   auto read_completion_once = [&]() -> bool {
     Error command_sync_err;
+    KmtProfCountInvalidate(0);
     if (!SyncBuffer(api, device, exec_buffer, 0, exec_buffer.size,
                     &command_sync_err)) {
       SetErrorFormat(out_error, "pathb command buffer invalidate failed: %s",
@@ -2154,6 +2320,7 @@ bool SubmitAndWaitPathBImpl(const KmtApi& api, const Device& device,
     packet_state = volatile_packet_header ? *volatile_packet_header : 0;
 
     Error ring_sync_err;
+    KmtProfCountInvalidate(0);
     if (!SyncBuffer(api, device, ring, 0, ring.size, &ring_sync_err)) {
       SetErrorFormat(out_error, "pathb completion ring invalidate failed: %s",
                      ErrorMessage(&ring_sync_err));
@@ -2307,6 +2474,7 @@ bool WaitForPathBSubmits(const KmtApi& api, const Device& device,
     uint32_t slot_state = 0;
     uint32_t packet_state = packet_header ? *packet_header : 0;
     Error command_sync_err;
+    KmtProfCountInvalidate(0);
     if (!SyncBuffer(api, device, p.exec_buffer, 0, p.exec_buffer.size,
                     &command_sync_err)) {
       SetErrorFormat(out_error,
@@ -2318,6 +2486,7 @@ bool WaitForPathBSubmits(const KmtApi& api, const Device& device,
     packet_state = packet_header ? *packet_header : 0;
 
     Error ring_sync_err;
+    KmtProfCountInvalidate(0);
     if (!SyncBuffer(api, device, p.ring, 0, p.ring.size, &ring_sync_err)) {
       SetErrorFormat(out_error,
                      "pathb batch completion ring invalidate failed: %s",

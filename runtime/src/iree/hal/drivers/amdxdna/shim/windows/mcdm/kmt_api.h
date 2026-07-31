@@ -298,6 +298,11 @@ uint64_t GetPathBChainChildHandle(const Device& device, Buffer* buffer);
 bool SyncBuffer(const KmtApi& api, const Device& device, const Buffer& buffer,
                 uint64_t offset, uint64_t length, Error* out_error);
 
+// Diagnostic-only: attribute D3DKMTInvalidateCache calls to a call-site bucket
+// (0=completion path, 1=per-dispatch I/O buffer sync, 2=aperture/other). No-op
+// unless the HRX_KMT_PROFILE profiler is enabled.
+void KmtProfCountInvalidate(int site);
+
 bool SyncCommandApertureCode(const KmtApi& api, const Device& device,
                              const CommandAperture& aperture, uint64_t offset,
                              uint64_t length, Error* out_error);

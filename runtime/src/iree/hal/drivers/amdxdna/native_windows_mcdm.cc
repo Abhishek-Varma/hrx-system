@@ -2448,6 +2448,7 @@ iree_status_t iree_hal_amdxdna_native_buffer_sync(
       }
       return iree_ok_status();
     }
+    mcdm::KmtProfCountInvalidate(1);
     if (!mcdm::SyncBuffer(buffer->device->api, buffer->device->device,
                           buffer->buffer, sync_offset, sync_size, &error)) {
       return status_from_mcdm_error(
@@ -2480,6 +2481,7 @@ iree_status_t iree_hal_amdxdna_native_buffer_sync(
     }
     return iree_ok_status();
   }
+  mcdm::KmtProfCountInvalidate(1);
   if (!mcdm::SyncBuffer(buffer->device->api, buffer->device->device,
                         buffer->buffer, sync_offset, sync_size, &error)) {
     return status_from_mcdm_error("amdxdna Windows MCDM BO sync failed", error);
