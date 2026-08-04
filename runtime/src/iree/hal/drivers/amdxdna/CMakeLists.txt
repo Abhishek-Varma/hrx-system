@@ -430,6 +430,22 @@ iree_cc_test(
 )
 endif()
 
+if(IREE_HAL_DRIVER_AMDXDNA AND (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Windows"))
+iree_cc_test(
+  NAME
+    context_cache_capacity_test
+  SRCS
+    "context_cache_capacity_test.cc"
+  DEPS
+    ::amdxdna
+    iree::testing::gtest
+    iree::testing::gtest_main
+  LABELS
+    "driver=amdxdna"
+    "iree-build-requirement=runtime.hal.amdxdna"
+)
+endif()
+
 ### BAZEL_TO_CMAKE_PRESERVES_ALL_CONTENT_BELOW_THIS_LINE ###
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND IREE_HAL_DRIVER_AMDXDNA)

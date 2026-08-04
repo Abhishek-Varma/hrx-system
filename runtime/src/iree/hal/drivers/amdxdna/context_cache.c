@@ -6,10 +6,29 @@
 
 #include "iree/hal/drivers/amdxdna/context_cache.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "iree/base/threading/mutex.h"
 #include "iree/hal/drivers/amdxdna/device.h"
+
+// Bounds how many native hardware contexts the cache keeps alive. The amdxdna
+// driver has only a small, process-global pool of concurrent hardware contexts,
+// so an unbounded cache exhausts it after enough distinct kernels. On overflow
+// the least-recently-used entry is evicted, dropping the cache's reference so
+// the context is reclaimed once no executable or command buffer still holds it.
+//
+// The capacity is a soft cap: the device reports a per-architecture budget
+// (max_hardware_contexts) that sizes the cache, but the true ceiling is not
+// queryable and varies with the part and its array partitioning. So
+// get_or_create_context treats it as a target and, on a creation failure from
+// pool exhaustion, evicts an LRU context and retries, backing off to whatever
+// the driver accepts.
+//
+// This default applies only when the device budget is unknown (0).
+// IREE_HAL_AMDXDNA_CONTEXT_CACHE_CAPACITY overrides it; 0 there disables the
+// proactive bound (the retry-on-exhaustion fallback still applies).
+#define IREE_HAL_AMDXDNA_CONTEXT_CACHE_DEFAULT_CAPACITY 8
 
 typedef struct iree_hal_amdxdna_context_cache_entry_t {
   iree_byte_span_t pdi;
@@ -19,11 +38,37 @@ typedef struct iree_hal_amdxdna_context_cache_entry_t {
   struct iree_hal_amdxdna_context_cache_entry_t* next;
 } iree_hal_amdxdna_context_cache_entry_t;
 
+// Entries form a singly-linked most-recently-used list: `head` is the MRU entry
+// and the tail is the LRU eviction target. A cache hit moves the entry to the
+// front; inserts prepend and evict the tail while `count` exceeds `capacity`.
 struct iree_hal_amdxdna_device_context_cache_t {
   iree_allocator_t host_allocator;
   iree_slim_mutex_t mutex;
   iree_hal_amdxdna_context_cache_entry_t* head;
+  iree_host_size_t count;
+  iree_host_size_t capacity;
 };
+
+iree_host_size_t iree_hal_amdxdna_context_cache_resolve_capacity(
+    iree_host_size_t hardware_context_budget) {
+  const char* env = getenv("IREE_HAL_AMDXDNA_CONTEXT_CACHE_CAPACITY");
+  if (env && *env) {
+    char* end = NULL;
+    unsigned long long value = strtoull(env, &end, 10);
+    // A fully-consumed parse wins, including an explicit 0 which disables the
+    // bound (unbounded cache). Malformed values fall back below.
+    if (end != env && *end == '\0') {
+      return (iree_host_size_t)value;
+    }
+  }
+  // Prefer the device-reported budget so the bound tracks the actual part; fall
+  // back to the conservative default when the architecture is unknown (budget
+  // 0), e.g. on backends that cannot resolve it yet.
+  if (hardware_context_budget != 0) {
+    return hardware_context_budget;
+  }
+  return IREE_HAL_AMDXDNA_CONTEXT_CACHE_DEFAULT_CAPACITY;
+}
 
 static bool iree_hal_amdxdna_byte_spans_equal(iree_const_byte_span_t lhs,
                                               iree_const_byte_span_t rhs) {
@@ -69,8 +114,31 @@ static void iree_hal_amdxdna_context_cache_entry_destroy(
   iree_allocator_free(host_allocator, entry);
 }
 
+// Evicts the least-recently-used entry (the list tail). Must be called with the
+// cache mutex held. Releasing the entry's context reference reclaims the
+// hardware context once no other owner (executable/command buffer) holds it.
+static void iree_hal_amdxdna_context_cache_evict_lru(
+    iree_hal_amdxdna_device_context_cache_t* context_cache) {
+  if (!context_cache->head) return;
+  iree_hal_amdxdna_context_cache_entry_t* prev = NULL;
+  iree_hal_amdxdna_context_cache_entry_t* tail = context_cache->head;
+  while (tail->next) {
+    prev = tail;
+    tail = tail->next;
+  }
+  if (prev) {
+    prev->next = NULL;
+  } else {
+    context_cache->head = NULL;
+  }
+  if (context_cache->count > 0) context_cache->count--;
+  iree_hal_amdxdna_context_cache_entry_destroy(context_cache->host_allocator,
+                                               tail);
+}
+
 iree_hal_amdxdna_device_context_cache_t*
-iree_hal_amdxdna_device_context_cache_create(iree_allocator_t host_allocator) {
+iree_hal_amdxdna_device_context_cache_create(
+    iree_allocator_t host_allocator, iree_host_size_t hardware_context_budget) {
   iree_hal_amdxdna_device_context_cache_t* context_cache = NULL;
   if (!iree_status_is_ok(iree_allocator_malloc(
           host_allocator, sizeof(*context_cache), (void**)&context_cache))) {
@@ -78,6 +146,8 @@ iree_hal_amdxdna_device_context_cache_create(iree_allocator_t host_allocator) {
   }
   memset(context_cache, 0, sizeof(*context_cache));
   context_cache->host_allocator = host_allocator;
+  context_cache->capacity =
+      iree_hal_amdxdna_context_cache_resolve_capacity(hardware_context_budget);
   iree_slim_mutex_initialize(&context_cache->mutex);
   return context_cache;
 }
@@ -97,6 +167,7 @@ void iree_hal_amdxdna_device_context_cache_clear(
   iree_slim_mutex_lock(&context_cache->mutex);
   iree_hal_amdxdna_context_cache_entry_t* entry = context_cache->head;
   context_cache->head = NULL;
+  context_cache->count = 0;
   iree_slim_mutex_unlock(&context_cache->mutex);
 
   while (entry) {
@@ -160,9 +231,10 @@ iree_status_t iree_hal_amdxdna_device_get_or_create_context(
   }
 
   iree_slim_mutex_lock(&device->context_cache->mutex);
+  iree_hal_amdxdna_context_cache_entry_t* prev = NULL;
   for (iree_hal_amdxdna_context_cache_entry_t* entry =
            device->context_cache->head;
-       entry; entry = entry->next) {
+       entry; prev = entry, entry = entry->next) {
     if (iree_hal_amdxdna_byte_spans_equal(
             iree_make_const_byte_span(entry->pdi.data, entry->pdi.data_length),
             key_pdi) &&
@@ -171,6 +243,13 @@ iree_status_t iree_hal_amdxdna_device_get_or_create_context(
                                       entry->xclbin.data_length),
             key_xclbin) &&
         iree_string_view_equal(entry->kernel_name, key_kernel_name)) {
+      // Cache hit: promote to MRU (front) so the LRU eviction order stays
+      // meaningful, then hand out an additional reference to the caller.
+      if (prev) {
+        prev->next = entry->next;
+        entry->next = device->context_cache->head;
+        device->context_cache->head = entry;
+      }
       *out_context_ref =
           iree_hal_amdxdna_native_context_ref_retain(entry->context_ref);
       iree_slim_mutex_unlock(&device->context_cache->mutex);
@@ -178,9 +257,29 @@ iree_status_t iree_hal_amdxdna_device_get_or_create_context(
     }
   }
 
+  // Make room before creating so we never momentarily exceed the cap, which on
+  // an already-full driver pool would itself fail. Eviction drops only the
+  // cache's reference; a context still held by a live executable or command
+  // buffer is not reclaimed until that owner releases it.
+  while (device->context_cache->capacity != 0 &&
+         device->context_cache->count >= device->context_cache->capacity) {
+    iree_hal_amdxdna_context_cache_evict_lru(device->context_cache);
+  }
+
+  // Create the hardware context. If creation fails because the driver's pool is
+  // exhausted, evict an LRU cached context (freeing its hwctx once no live owner
+  // holds it) and retry until it succeeds or no cached context remains. The
+  // budget is only a soft cap; this backoff is what keeps the cache safe on
+  // parts whose real ceiling is below it.
   iree_hal_amdxdna_native_context_ref_t* context_ref = NULL;
-  iree_status_t status = iree_hal_amdxdna_native_device_c_create_context_ref(
-      device->native_device, &context_image, &context_ref);
+  iree_status_t status = iree_ok_status();
+  for (;;) {
+    status = iree_hal_amdxdna_native_device_c_create_context_ref(
+        device->native_device, &context_image, &context_ref);
+    if (iree_status_is_ok(status) || !device->context_cache->head) break;
+    iree_status_ignore(status);
+    iree_hal_amdxdna_context_cache_evict_lru(device->context_cache);
+  }
   if (!iree_status_is_ok(status)) {
     iree_slim_mutex_unlock(&device->context_cache->mutex);
     return status;
@@ -207,7 +306,15 @@ iree_status_t iree_hal_amdxdna_device_get_or_create_context(
     entry->context_ref = context_ref;
     entry->next = device->context_cache->head;
     device->context_cache->head = entry;
+    device->context_cache->count++;
     *out_context_ref = iree_hal_amdxdna_native_context_ref_retain(context_ref);
+    // Bound the number of cached hardware contexts. Eviction only drops the
+    // cache's reference; contexts still referenced by live executables or
+    // command buffers survive until those owners release them.
+    while (device->context_cache->capacity != 0 &&
+           device->context_cache->count > device->context_cache->capacity) {
+      iree_hal_amdxdna_context_cache_evict_lru(device->context_cache);
+    }
     iree_slim_mutex_unlock(&device->context_cache->mutex);
     return iree_ok_status();
   }

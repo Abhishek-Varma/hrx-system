@@ -41,6 +41,10 @@ struct iree_hal_amdxdna_native_device_t {
   iree_hal_amdxdna_native_c_command_chain_status_t command_chain_status =
       IREE_HAL_AMDXDNA_NATIVE_C_COMMAND_CHAIN_STATUS_ENABLED_BY_DEFAULT;
   bool supports_command_chain = true;
+  // Concurrent hardware-context budget for this part, resolved once at device
+  // creation from the NPU architecture (the KMD has no query for it). 0 when the
+  // architecture is unrecognized. See query_caps.
+  uint32_t hardware_context_budget = 0;
   std::mutex command_pool_mutex;
   std::vector<std::unique_ptr<shim_xdna::kernel>> start_npu_command_pool;
 
@@ -558,6 +562,12 @@ iree_status_t iree_hal_amdxdna_native_device_create(
       select_command_chain_status(driver_stack_info);
   device->supports_command_chain =
       command_chain_enabled(device->command_chain_status);
+  // Resolve the per-architecture hardware-context budget once. query_npu_arch()
+  // reads sysfs, so cache it here rather than on every query_caps() call.
+  const std::string npu_arch = shim_xdna::query_npu_arch();
+  device->hardware_context_budget =
+      iree_hal_amdxdna_hardware_context_budget_for_arch(
+          iree_make_string_view(npu_arch.data(), npu_arch.size()));
   *out_device = device;
   return iree_ok_status();
 }
@@ -636,6 +646,7 @@ iree_status_t iree_hal_amdxdna_native_device_query_caps(
           ? std::min(chain_slot_capacity(kMaxExecBoSize),
                      kKmqDefaultChainSlots)
           : 0;
+  caps.max_hardware_contexts = device->hardware_context_budget;
   caps.context_image_models = IREE_HAL_AMDXDNA_NATIVE_C_CONTEXT_IMAGE_MODEL_PDI;
   // START_NPU is used for command-chain children and is correct on Linux KMQ.
   // Do not advertise PARTIAL_ELF here: its resident-instruction path currently

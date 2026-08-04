@@ -369,6 +369,18 @@ iree_runtime_cc_test(
 )
 
 iree_runtime_cc_test(
+    name = "context_cache_capacity_test",
+    srcs = ["context_cache_capacity_test.cc"],
+    tags = _AMDXDNA_UNIT_TEST_TAGS,
+    target_compatible_with = _AMDXDNA_COMPATIBLE_WITH,
+    deps = [
+        ":amdxdna",
+        "//runtime/src/iree/testing:gtest",
+        "//runtime/src/iree/testing:gtest_main",
+    ],
+)
+
+iree_runtime_cc_test(
     name = "semaphore_test",
     srcs = ["semaphore_test.cc"],
     tags = _AMDXDNA_UNIT_TEST_TAGS,

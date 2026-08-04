@@ -120,6 +120,13 @@ typedef struct iree_hal_amdxdna_native_c_device_caps_t {
   uint32_t ddi_version;
   uint32_t max_effective_queues;
   uint32_t max_command_chain_slots;
+  // Concurrent hardware-context budget for this NPU, i.e. how many native
+  // hardware contexts may be kept alive at once before the driver refuses to
+  // create more. The amdxdna KMD exposes no query for this ceiling, so backends
+  // derive it from the device architecture (see
+  // iree_hal_amdxdna_hardware_context_budget_for_arch). 0 means "unknown"; the
+  // context cache then falls back to a conservative default.
+  uint32_t max_hardware_contexts;
   uint32_t context_image_models;
   uint32_t dispatch_models;
   iree_hal_amdxdna_native_c_buffer_sync_model_t buffer_sync_model;
@@ -134,6 +141,28 @@ typedef struct iree_hal_amdxdna_native_c_device_caps_t {
   iree_hal_amdxdna_native_c_command_chain_status_t command_chain_status;
   iree_hal_amdxdna_native_c_driver_stack_t driver_stack;
 } iree_hal_amdxdna_native_c_device_caps_t;
+
+// Maps an NPU architecture name (e.g. "Phoenix", "Strix", "Strix Halo",
+// "Krackan") to a soft concurrent hardware-context budget: how many native
+// contexts the cache aims to keep alive. The KMD exposes no query for the true
+// ceiling, which also varies with the part and its array partitioning, so this
+// is a target, not a hard limit -- the context cache evicts and retries on
+// creation failure to back off to whatever the driver accepts. The budget is
+// architecture-keyed (identical on Linux and Windows for a given part). Returns
+// 0 for an unknown architecture, signaling the caller to use a default.
+static inline uint32_t iree_hal_amdxdna_hardware_context_budget_for_arch(
+    iree_string_view_t arch) {
+  // Phoenix (npu1).
+  if (iree_string_view_starts_with(arch, IREE_SV("Phoenix"))) {
+    return 6;
+  }
+  // Strix / Strix Halo / Krackan (npu2 family).
+  if (iree_string_view_starts_with(arch, IREE_SV("Strix")) ||
+      iree_string_view_starts_with(arch, IREE_SV("Krackan"))) {
+    return 32;
+  }
+  return 0;  // unknown architecture -> caller falls back to a default
+}
 
 typedef struct iree_hal_amdxdna_native_c_context_image_t {
   iree_hal_amdxdna_native_c_context_image_type_t type;

@@ -2162,6 +2162,12 @@ iree_status_t iree_hal_amdxdna_native_device_query_caps(
   const size_t chain_exec_bo_size =
       static_cast<size_t>(windows_dpu_pathb_chain_exec_bo_size());
   caps.max_command_chain_slots = chain_slot_capacity(chain_exec_bo_size);
+  // MCDM cannot resolve the NPU architecture yet, so report 0 (unknown) and let
+  // the context cache use its default. TODO: derive the architecture (e.g. from
+  // driver_stack.pci_device_id) and reuse
+  // iree_hal_amdxdna_hardware_context_budget_for_arch so Windows and Linux
+  // report the same budget for a given part.
+  caps.max_hardware_contexts = 0;
   caps.context_image_models =
       IREE_HAL_AMDXDNA_NATIVE_C_CONTEXT_IMAGE_MODEL_XCLBIN;
   caps.dispatch_models = IREE_HAL_AMDXDNA_NATIVE_C_DISPATCH_MODEL_START_CU |
