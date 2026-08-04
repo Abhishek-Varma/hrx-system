@@ -510,11 +510,36 @@ iree_status_t create_native_buffer_from_mcdm(
   return iree_ok_status();
 }
 
+// A/B toggle for the Linux/XRT-parity in-place HOST_ONLY sync. Default on; set
+// HRX_INPLACE_HOST=0 to force the legacy host_mirror + per-sync memcpy path so
+// the two can be compared back-to-back under identical NPU thermal state.
+bool hrx_inplace_host_sync_enabled() {
+  static int cached = -1;
+  if (cached < 0) {
+    char b[8];
+    DWORD n = GetEnvironmentVariableA("HRX_INPLACE_HOST", b, sizeof(b));
+    cached = (n > 0 && n < sizeof(b) && b[0] == '0') ? 0 : 1;
+  }
+  return cached == 1;
+}
+
 iree_status_t ensure_host_buffer_mirror(
     iree_hal_amdxdna_native_buffer_t* buffer) {
   if (!buffer ||
       buffer->type != IREE_HAL_AMDXDNA_NATIVE_BUFFER_TYPE_HOST_ONLY ||
       buffer->host_mirror) {
+    return iree_ok_status();
+  }
+  // Linux/XRT-parity fast path: an eagerly-allocated (non-deferred) HOST_ONLY BO
+  // already exposes a stable D3DKMTLock2 CPU mapping. Read and write it in place
+  // (like the cacheable BO path and Linux's persistent mmap) instead of
+  // shadowing through a separate host mirror + per-sync memcpy; the Lock2 VA has
+  // been verified never to move across Path-B submits. Deferred buffers keep the
+  // mirror (they enter here with host_mirror already set to deferred_storage, so
+  // this branch is not reached for them) because IREE caches their host pointer
+  // before the real BO exists.
+  if (hrx_inplace_host_sync_enabled() && !buffer->deferred &&
+      buffer->buffer.cpu_ptr) {
     return iree_ok_status();
   }
   if (buffer->buffer.size >
@@ -2425,6 +2450,28 @@ iree_status_t iree_hal_amdxdna_native_buffer_sync(
   if (buffer->type == IREE_HAL_AMDXDNA_NATIVE_BUFFER_TYPE_HOST_ONLY) {
     IREE_RETURN_IF_ERROR(ensure_host_buffer_mirror(buffer));
     mcdm::Error error;
+    // Linux/XRT-parity in-place path: when there is no shadow mirror (eagerly
+    // allocated BO with a stable Lock2 mapping), operate directly on the BO
+    // (H2D publishes dirty cache lines; D2H invalidates), exactly like the
+    // cacheable/instruction BO path below and Linux's clflush-only bo::sync().
+    // Avoids the per-sync memcpy + Unlock2/Lock2 remap that dominate wall time.
+    if (!buffer->host_mirror) {
+      if (direction == IREE_HAL_AMDXDNA_NATIVE_BUFFER_SYNC_HOST_TO_DEVICE) {
+        if (!mcdm::PublishBufferCpuWrites(buffer->buffer, sync_offset, sync_size,
+                                          &error)) {
+          return status_from_mcdm_error(
+              "amdxdna Windows MCDM host BO publication failed", error);
+        }
+      } else {
+        mcdm::KmtProfCountInvalidate(1);
+        if (!mcdm::SyncBuffer(buffer->device->api, buffer->device->device,
+                              buffer->buffer, sync_offset, sync_size, &error)) {
+          return status_from_mcdm_error(
+              "amdxdna Windows MCDM host BO cache invalidate failed", error);
+        }
+      }
+      return iree_ok_status();
+    }
     if (direction == IREE_HAL_AMDXDNA_NATIVE_BUFFER_SYNC_HOST_TO_DEVICE) {
       if (buffer->native_mapping_stale) {
         if (!mcdm::RefreshBufferCpuMapping(buffer->device->api,
