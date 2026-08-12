@@ -11,6 +11,7 @@
 
 #include "iree/base/threading/mutex.h"
 #include "iree/hal/drivers/amdxdna/device.h"
+#include "iree/hal/drivers/amdxdna/executable_internal.h"
 
 // Bounds how many native hardware contexts the cache keeps alive. The amdxdna
 // driver has only a small, process-global pool of concurrent hardware contexts,
@@ -34,6 +35,14 @@ typedef struct iree_hal_amdxdna_context_cache_entry_t {
   iree_byte_span_t pdi;
   iree_byte_span_t xclbin;
   iree_string_view_t kernel_name;
+  // Owned deep copy of the control code (AIE instruction run list), part of the
+  // reuse key and matched byte-for-byte. The NPU retains per-context array state
+  // across dispatches, so a context is reused only for identical control code;
+  // reusing it under different code runs against residual state (wrong results
+  // or a firmware hang). PDI + kernel name alone is not safe -- K/N-transposed
+  // GEMMs share a PDI but differ here.
+  iree_hal_amdxdna_u32_list_t* control_codes;
+  iree_host_size_t control_code_count;
   iree_hal_amdxdna_native_context_ref_t* context_ref;
   struct iree_hal_amdxdna_context_cache_entry_t* next;
 } iree_hal_amdxdna_context_cache_entry_t;
@@ -77,6 +86,34 @@ static bool iree_hal_amdxdna_byte_spans_equal(iree_const_byte_span_t lhs,
           memcmp(lhs.data, rhs.data, lhs.data_length) == 0);
 }
 
+// Deep-compares two control-code run lists for byte-for-byte equality. Empty
+// lists compare equal to each other.
+static bool iree_hal_amdxdna_control_codes_equal(
+    const iree_hal_amdxdna_u32_list_t* lhs, iree_host_size_t lhs_count,
+    const iree_hal_amdxdna_u32_list_t* rhs, iree_host_size_t rhs_count) {
+  if (lhs_count != rhs_count) return false;
+  for (iree_host_size_t i = 0; i < lhs_count; ++i) {
+    if (lhs[i].count != rhs[i].count) return false;
+    if (lhs[i].count != 0 &&
+        memcmp(lhs[i].data, rhs[i].data, lhs[i].count * sizeof(uint32_t)) !=
+            0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool iree_hal_amdxdna_context_cache_key_equal(
+    const iree_hal_amdxdna_context_cache_key_t* lhs,
+    const iree_hal_amdxdna_context_cache_key_t* rhs) {
+  return iree_hal_amdxdna_byte_spans_equal(lhs->pdi, rhs->pdi) &&
+         iree_hal_amdxdna_byte_spans_equal(lhs->xclbin, rhs->xclbin) &&
+         iree_string_view_equal(lhs->kernel_name, rhs->kernel_name) &&
+         iree_hal_amdxdna_control_codes_equal(
+             lhs->control_codes, lhs->control_code_count, rhs->control_codes,
+             rhs->control_code_count);
+}
+
 static iree_status_t iree_hal_amdxdna_context_cache_copy_bytes(
     iree_allocator_t host_allocator, iree_const_byte_span_t source,
     iree_byte_span_t* out_copy) {
@@ -87,6 +124,48 @@ static iree_status_t iree_hal_amdxdna_context_cache_copy_bytes(
                                              (void**)&storage));
   memcpy(storage, source.data, source.data_length);
   *out_copy = iree_make_byte_span(storage, source.data_length);
+  return iree_ok_status();
+}
+
+static void iree_hal_amdxdna_context_cache_free_control_codes(
+    iree_allocator_t host_allocator, iree_hal_amdxdna_u32_list_t* control_codes,
+    iree_host_size_t control_code_count) {
+  if (!control_codes) return;
+  for (iree_host_size_t i = 0; i < control_code_count; ++i) {
+    iree_allocator_free(host_allocator, control_codes[i].data);
+  }
+  iree_allocator_free(host_allocator, control_codes);
+}
+
+// Deep-copies a control-code run list into cache-owned storage so the entry
+// outlives the executable that produced it (eviction only drops the cache's
+// context reference; the entry itself may be reused/compared later).
+static iree_status_t iree_hal_amdxdna_context_cache_copy_control_codes(
+    iree_allocator_t host_allocator,
+    const iree_hal_amdxdna_u32_list_t* source, iree_host_size_t source_count,
+    iree_hal_amdxdna_u32_list_t** out_control_codes,
+    iree_host_size_t* out_control_code_count) {
+  *out_control_codes = NULL;
+  *out_control_code_count = 0;
+  if (source_count == 0) return iree_ok_status();
+  iree_hal_amdxdna_u32_list_t* copy = NULL;
+  IREE_RETURN_IF_ERROR(iree_allocator_malloc(
+      host_allocator, source_count * sizeof(*copy), (void**)&copy));
+  memset(copy, 0, source_count * sizeof(*copy));
+  for (iree_host_size_t i = 0; i < source_count; ++i) {
+    copy[i].count = source[i].count;
+    if (source[i].count == 0) continue;
+    iree_status_t status = iree_allocator_malloc(
+        host_allocator, source[i].count * sizeof(uint32_t),
+        (void**)&copy[i].data);
+    if (!iree_status_is_ok(status)) {
+      iree_hal_amdxdna_context_cache_free_control_codes(host_allocator, copy, i);
+      return status;
+    }
+    memcpy(copy[i].data, source[i].data, source[i].count * sizeof(uint32_t));
+  }
+  *out_control_codes = copy;
+  *out_control_code_count = source_count;
   return iree_ok_status();
 }
 
@@ -111,6 +190,8 @@ static void iree_hal_amdxdna_context_cache_entry_destroy(
   iree_allocator_free(host_allocator, entry->pdi.data);
   iree_allocator_free(host_allocator, entry->xclbin.data);
   iree_allocator_free(host_allocator, (void*)entry->kernel_name.data);
+  iree_hal_amdxdna_context_cache_free_control_codes(
+      host_allocator, entry->control_codes, entry->control_code_count);
   iree_allocator_free(host_allocator, entry);
 }
 
@@ -181,6 +262,8 @@ void iree_hal_amdxdna_device_context_cache_clear(
 iree_status_t iree_hal_amdxdna_device_get_or_create_context(
     iree_hal_amdxdna_device* device, iree_const_byte_span_t pdi,
     iree_const_byte_span_t xclbin, iree_string_view_t kernel_name,
+    const iree_hal_amdxdna_u32_list_t* control_codes,
+    iree_host_size_t control_code_count,
     iree_hal_amdxdna_native_context_ref_t** out_context_ref) {
   *out_context_ref = NULL;
   if (pdi.data_length == 0 && xclbin.data_length == 0) {
@@ -230,19 +313,29 @@ iree_status_t iree_hal_amdxdna_device_get_or_create_context(
     context_image.xclbin = iree_const_byte_span_empty();
   }
 
+  const iree_hal_amdxdna_context_cache_key_t request_key = {
+      /*.pdi=*/key_pdi,
+      /*.xclbin=*/key_xclbin,
+      /*.kernel_name=*/key_kernel_name,
+      /*.control_codes=*/control_codes,
+      /*.control_code_count=*/control_code_count,
+  };
+
   iree_slim_mutex_lock(&device->context_cache->mutex);
   iree_hal_amdxdna_context_cache_entry_t* prev = NULL;
   for (iree_hal_amdxdna_context_cache_entry_t* entry =
            device->context_cache->head;
        entry; prev = entry, entry = entry->next) {
-    if (iree_hal_amdxdna_byte_spans_equal(
-            iree_make_const_byte_span(entry->pdi.data, entry->pdi.data_length),
-            key_pdi) &&
-        iree_hal_amdxdna_byte_spans_equal(
-            iree_make_const_byte_span(entry->xclbin.data,
-                                      entry->xclbin.data_length),
-            key_xclbin) &&
-        iree_string_view_equal(entry->kernel_name, key_kernel_name)) {
+    const iree_hal_amdxdna_context_cache_key_t entry_key = {
+        /*.pdi=*/iree_make_const_byte_span(entry->pdi.data,
+                                           entry->pdi.data_length),
+        /*.xclbin=*/
+        iree_make_const_byte_span(entry->xclbin.data, entry->xclbin.data_length),
+        /*.kernel_name=*/entry->kernel_name,
+        /*.control_codes=*/entry->control_codes,
+        /*.control_code_count=*/entry->control_code_count,
+    };
+    if (iree_hal_amdxdna_context_cache_key_equal(&entry_key, &request_key)) {
       // Cache hit: promote to MRU (front) so the LRU eviction order stays
       // meaningful, then hand out an additional reference to the caller.
       if (prev) {
@@ -301,6 +394,11 @@ iree_status_t iree_hal_amdxdna_device_get_or_create_context(
     status = iree_hal_amdxdna_context_cache_copy_string(
         device->context_cache->host_allocator, key_kernel_name,
         &entry->kernel_name);
+  }
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_amdxdna_context_cache_copy_control_codes(
+        device->context_cache->host_allocator, control_codes,
+        control_code_count, &entry->control_codes, &entry->control_code_count);
   }
   if (iree_status_is_ok(status)) {
     entry->context_ref = context_ref;

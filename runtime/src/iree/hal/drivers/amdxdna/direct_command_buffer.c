@@ -1393,9 +1393,9 @@ iree_hal_amdxdna_direct_command_buffer_submit_accumulated_single(
             cmd->command);
         if (single_cache_entry) {
           iree_hal_amdxdna_single_command_cache_entry_set_descriptor_template(
-              single_cache_entry, cmd->src_asm_inst, cmd->src_patches,
-              cmd->src_constant_count, cmd->src_use_native_partial_elf,
-              cmd->ctrl_code_mapped_ptr);
+              single_command_cache, single_cache_entry, cmd->src_asm_inst,
+              cmd->src_patches, cmd->src_constant_count,
+              cmd->src_use_native_partial_elf, cmd->ctrl_code_mapped_ptr);
           cmd->ctrl_code = NULL;
           cmd->ctrl_code_mapped_ptr = NULL;
           cmd->command = NULL;
@@ -2583,7 +2583,8 @@ iree_status_t iree_hal_amdxdna_direct_command_buffer_dispatch_plan(
       iree_hal_amdxdna_native_context_ref_t* raw_context_ref = NULL;
       status = iree_hal_amdxdna_device_get_or_create_context(
           command_buffer->device, plan->pdi_span, plan->xclbin_span,
-          plan->kernel_name, &raw_context_ref);
+          plan->kernel_name, plan->control_codes, plan->control_code_count,
+          &raw_context_ref);
       if (iree_status_is_ok(status)) {
         context_ref = raw_context_ref;
         status = iree_hal_amdxdna_native_context_ref_open_cu(
@@ -2601,7 +2602,8 @@ iree_status_t iree_hal_amdxdna_direct_command_buffer_dispatch_plan(
                                            kernel_params->xclbin.count != 0)) {
     status = iree_hal_amdxdna_device_get_or_create_context(
         command_buffer->device, plan->pdi_span, plan->xclbin_span,
-        plan->kernel_name, &context_ref);
+        plan->kernel_name, plan->control_codes, plan->control_code_count,
+        &context_ref);
     if (iree_status_is_ok(status)) {
       status = iree_hal_amdxdna_native_context_ref_open_cu(
           context_ref, plan->kernel_name, &cu_idx);
