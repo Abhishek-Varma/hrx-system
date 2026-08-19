@@ -164,6 +164,29 @@ static inline uint32_t iree_hal_amdxdna_hardware_context_budget_for_arch(
   return 0;  // unknown architecture -> caller falls back to a default
 }
 
+// Maps AMD PCI IDs to the same architecture names Linux derives from sysfs.
+// revision_id is reserved for future disambiguation; device_id is sufficient
+// today for Phoenix (0x1502) vs Strix/Krackan-family (0x17f0) parts.
+static inline iree_string_view_t iree_hal_amdxdna_npu_arch_for_pci(
+    uint32_t vendor_id, uint32_t device_id, uint32_t revision_id) {
+  (void)revision_id;
+  if (vendor_id != 0x1022u) return iree_string_view_empty();
+  switch (device_id) {
+    case 0x1502u:
+      return IREE_SV("Phoenix");
+    case 0x17f0u:
+      return IREE_SV("Strix");
+    default:
+      return iree_string_view_empty();
+  }
+}
+
+static inline uint32_t iree_hal_amdxdna_hardware_context_budget_for_pci(
+    uint32_t vendor_id, uint32_t device_id, uint32_t revision_id) {
+  return iree_hal_amdxdna_hardware_context_budget_for_arch(
+      iree_hal_amdxdna_npu_arch_for_pci(vendor_id, device_id, revision_id));
+}
+
 typedef struct iree_hal_amdxdna_native_c_context_image_t {
   iree_hal_amdxdna_native_c_context_image_type_t type;
   iree_const_byte_span_t pdi;

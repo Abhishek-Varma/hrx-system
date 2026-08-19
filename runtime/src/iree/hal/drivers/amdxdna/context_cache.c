@@ -313,12 +313,19 @@ iree_status_t iree_hal_amdxdna_device_get_or_create_context(
     context_image.xclbin = iree_const_byte_span_empty();
   }
 
+  // Key on control code for PDI-backed contexts: identical PDI + kernel name can
+  // carry different AIE programs (e.g. K/N-transposed GEMMs) and must not share
+  // residual array state. The Windows MCDM xclbin-only path repatches control
+  // streams per dispatch, so omit control code from the xclbin cache key there.
+  const bool key_control_code =
+      !(use_xclbin_context && key_pdi.data_length == 0);
   const iree_hal_amdxdna_context_cache_key_t request_key = {
       /*.pdi=*/key_pdi,
       /*.xclbin=*/key_xclbin,
       /*.kernel_name=*/key_kernel_name,
-      /*.control_codes=*/control_codes,
-      /*.control_code_count=*/control_code_count,
+      /*.control_codes=*/key_control_code ? control_codes : NULL,
+      /*.control_code_count=*/
+      key_control_code ? control_code_count : 0,
   };
 
   iree_slim_mutex_lock(&device->context_cache->mutex);
@@ -332,8 +339,10 @@ iree_status_t iree_hal_amdxdna_device_get_or_create_context(
         /*.xclbin=*/
         iree_make_const_byte_span(entry->xclbin.data, entry->xclbin.data_length),
         /*.kernel_name=*/entry->kernel_name,
-        /*.control_codes=*/entry->control_codes,
-        /*.control_code_count=*/entry->control_code_count,
+        /*.control_codes=*/
+        key_control_code ? entry->control_codes : NULL,
+        /*.control_code_count=*/
+        key_control_code ? entry->control_code_count : 0,
     };
     if (iree_hal_amdxdna_context_cache_key_equal(&entry_key, &request_key)) {
       // Cache hit: promote to MRU (front) so the LRU eviction order stays
@@ -395,7 +404,7 @@ iree_status_t iree_hal_amdxdna_device_get_or_create_context(
         device->context_cache->host_allocator, key_kernel_name,
         &entry->kernel_name);
   }
-  if (iree_status_is_ok(status)) {
+  if (iree_status_is_ok(status) && key_control_code) {
     status = iree_hal_amdxdna_context_cache_copy_control_codes(
         device->context_cache->host_allocator, control_codes,
         control_code_count, &entry->control_codes, &entry->control_code_count);

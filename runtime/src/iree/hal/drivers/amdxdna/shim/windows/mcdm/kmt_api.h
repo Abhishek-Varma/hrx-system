@@ -152,12 +152,20 @@ struct KmtApi {
 
 bool QueryMcdmAbi(const KmtApi& api, D3DKMT_HANDLE adapter, McdmAbi* out_abi,
                   Error* out_error);
+// Resolves AMD NPU PCI IDs from the present IpuMcdmDriver ComputeAccelerator
+// device when KMTQAITYPE_PHYSICALADAPTERDEVICEIDS is unavailable.
+bool QueryNpuPciIdsFromPnP(uint32_t* out_vendor_id, uint32_t* out_device_id,
+                           uint32_t* out_revision_id);
 
 struct Adapter {
   D3DKMT_HANDLE handle = 0;
   LUID luid = {};
   D3DKMT_HANDLE retained_handles[kMaxRetainedAdapterHandles] = {};
   size_t retained_handle_count = 0;
+  bool has_pci_ids = false;
+  uint32_t pci_vendor_id = 0;
+  uint32_t pci_device_id = 0;
+  uint32_t pci_revision_id = 0;
 };
 
 struct Device {
@@ -172,6 +180,10 @@ struct Device {
   // device-wide watermark before every HW-queue submit.
   mutable volatile LONG64 pending_paging_fence_value = 0;
   McdmAbi mcdm_abi = McdmAbi::legacy;
+  bool has_pci_ids = false;
+  uint32_t pci_vendor_id = 0;
+  uint32_t pci_device_id = 0;
+  uint32_t pci_revision_id = 0;
 };
 
 struct Buffer {

@@ -37,6 +37,26 @@ TEST(HardwareContextBudgetTest, UnknownArchitectureIsZero) {
       0u);
 }
 
+TEST(HardwareContextBudgetTest, MapsKnownPciIds) {
+  EXPECT_TRUE(iree_string_view_equal(
+      iree_hal_amdxdna_npu_arch_for_pci(0x1022u, 0x1502u, 0u),
+      IREE_SV("Phoenix")));
+  EXPECT_TRUE(iree_string_view_equal(
+      iree_hal_amdxdna_npu_arch_for_pci(0x1022u, 0x17f0u, 0x11u),
+      IREE_SV("Strix")));
+  EXPECT_EQ(iree_hal_amdxdna_hardware_context_budget_for_pci(0x1022u, 0x1502u,
+                                                             0u),
+            6u);
+  EXPECT_EQ(iree_hal_amdxdna_hardware_context_budget_for_pci(0x1022u, 0x17f0u,
+                                                             0x11u),
+            32u);
+  EXPECT_TRUE(iree_string_view_is_empty(
+      iree_hal_amdxdna_npu_arch_for_pci(0x1022u, 0xffffu, 0u)));
+  EXPECT_EQ(iree_hal_amdxdna_hardware_context_budget_for_pci(0x8086u, 0x17f0u,
+                                                             0u),
+            0u);
+}
+
 // Capacity precedence with no env override: a nonzero device budget wins, and a
 // zero budget (unknown architecture) falls back to the built-in default of 8.
 TEST(ContextCacheCapacityTest, PrefersDeviceBudget) {
