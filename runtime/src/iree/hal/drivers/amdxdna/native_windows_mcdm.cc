@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -20,7 +21,6 @@
 #include "iree/hal/drivers/amdxdna/direct_command_buffer_planning.h"
 #include "iree/hal/drivers/amdxdna/native.h"
 #include "iree/hal/drivers/amdxdna/native_windows_mcdm_internal.h"
-#include "iree/hal/drivers/amdxdna/reclaim_debug.h"
 #include "iree/hal/drivers/amdxdna/shim/ert.h"
 #include "iree/hal/drivers/amdxdna/shim/windows/mcdm/context_blob.h"
 #include "iree/hal/drivers/amdxdna/shim/windows/mcdm/kmt_api.h"
@@ -28,6 +28,25 @@
 namespace mcdm = iree::hal::amdxdna::mcdm;
 
 namespace {
+
+// Self-heal is enabled by default; HRX_SELF_HEAL_RECREATE=0 forces it off.
+int iree_hal_amdxdna_self_heal_recreate_enabled(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char* e = getenv("HRX_SELF_HEAL_RECREATE");
+    cached = (e && e[0] == '0') ? 0 : 1;
+  }
+  return cached;
+}
+
+// Rare context-recovery events are logged unconditionally: they record that a
+// firmware PDI-array displacement was detected and healed on fresh hardware.
+#define HRX_SELF_HEAL_LOG(...)             \
+  do {                                     \
+    fprintf(stderr, "[HRX] " __VA_ARGS__); \
+    fprintf(stderr, "\n");                 \
+    fflush(stderr);                        \
+  } while (0)
 
 constexpr uint64_t kMaxExecBoSize = 4096;
 
@@ -594,20 +613,8 @@ iree_status_t reserve_command_persistent_code_slots(
   std::lock_guard<std::mutex> lock(command->device->pathb_context_mutex);
   if (command->pathb_single_code_owner_context == context &&
       command->pathb_single_code_aperture_capacity >= required_capacity) {
-    HRXRDBG("reserve_slots: REUSE cmd=%p owner_ctx=%p req_cap=%llu "
-            "cur_cap=%llu code_staged=%d (aperture NOT re-staged)",
-            (void*)command, (void*)context,
-            (unsigned long long)required_capacity,
-            (unsigned long long)command->pathb_single_code_aperture_capacity,
-            command->pathb_code_staged ? 1 : 0);
     return iree_ok_status();
   }
-  HRXRDBG("reserve_slots: FRESH cmd=%p old_owner_ctx=%p new_ctx=%p req_cap=%llu "
-          "old_cap=%llu code_staged=%d",
-          (void*)command, (void*)command->pathb_single_code_owner_context,
-          (void*)context, (unsigned long long)required_capacity,
-          (unsigned long long)command->pathb_single_code_aperture_capacity,
-          command->pathb_code_staged ? 1 : 0);
   release_command_persistent_code_slots_locked(command);
   const uint64_t slot_size = context->pathb_persistent_code_slot_size;
   if (!slot_size || required_capacity > UINT64_MAX - (slot_size - 1)) {
@@ -1116,14 +1123,6 @@ iree_status_t stage_windows_dpu_code_buffer(
         queue->context->pathb_single_code_staged_offset == code_offset &&
         std::memcmp(code_cpu_ptr, command->control_buffer->buffer.cpu_ptr,
                     static_cast<size_t>(command->control_buffer_size)) == 0));
-  HRXRDBG("stage_code: cmd=%p ctx=%p owner_ctx=%p code_off=0x%llx cap=0x%llx "
-          "ctrl_sz=0x%llx shared_view=%d same_staged=%d partial_elf=%d",
-          (void*)command, (void*)queue->context,
-          (void*)command->pathb_single_code_owner_context,
-          (unsigned long long)code_offset, (unsigned long long)slot_capacity,
-          (unsigned long long)command->control_buffer_size,
-          uses_shared_command_code_view ? 1 : 0, same_staged_code ? 1 : 0,
-          is_partial_elf ? 1 : 0);
   if (same_staged_code) {
     if (is_partial_elf) {
       IREE_RETURN_IF_ERROR(ensure_pathb_single_code_range_active(
@@ -2832,13 +2831,6 @@ iree_status_t iree_hal_amdxdna_native_device_create_context(
   native_context->queue.context = native_context;
   device->pathb_active_context = native_context;
   *out_context = native_context;
-  HRXRDBG("ctx_CREATE: ctx=%p code_off=0x%llx code_size=0x%llx slot_sz=0x%llx "
-          "pdi_len=%zu (PDI loaded via SubmitAndWaitPathBSetup)",
-          (void*)native_context,
-          (unsigned long long)command_aperture.code_offset,
-          (unsigned long long)command_aperture.code_size,
-          (unsigned long long)native_context->pathb_persistent_code_slot_size,
-          (size_t)pdi.data_length);
   return iree_ok_status();
 }
 
@@ -2854,16 +2846,8 @@ void iree_hal_amdxdna_native_context_destroy(
   if (device->pathb_active_context == context) {
     device->pathb_active_context = nullptr;
   }
-  HRXRDBG("ctx_DESTROY: ctx=%p num_pinned_cmds=%zu (resetting owner_context; "
-          "NOTE pathb_code_staged NOT reset on these commands)",
-          (void*)context, context->pathb_persistent_code_commands.size());
   for (iree_hal_amdxdna_native_command_t* command :
        context->pathb_persistent_code_commands) {
-    HRXRDBG("ctx_DESTROY:   detach cmd=%p old_owner_ctx=%p code_staged=%d "
-            "staged_off=0x%llx",
-            (void*)command, (void*)command->pathb_single_code_owner_context,
-            command->pathb_code_staged ? 1 : 0,
-            (unsigned long long)command->pathb_single_code_aperture_offset);
     command->pathb_single_code_owner_context = nullptr;
     command->pathb_single_code_first_slot = 0;
     command->pathb_single_code_slot_count = 0;
@@ -3031,10 +3015,11 @@ iree_status_t iree_hal_amdxdna_native_context_reload_pdi(
   context->pathb_next_completion_slot = 0;
 
   device->pathb_active_context = context;
-  HRXRDBG("self_heal: RELOADED ctx=%p code_off=0x%llx code_size=0x%llx "
-          "pdi_len=%zu (fresh hardware context; PDI re-setup)",
-          (void*)context, (unsigned long long)aperture.code_offset,
-          (unsigned long long)aperture.code_size, context->saved_pdi.size());
+  HRX_SELF_HEAL_LOG(
+      "self_heal: RELOADED ctx=%p code_off=0x%llx code_size=0x%llx pdi_len=%zu "
+      "(fresh hardware context; PDI re-setup)",
+      (void*)context, (unsigned long long)aperture.code_offset,
+      (unsigned long long)aperture.code_size, context->saved_pdi.size());
   return iree_ok_status();
 }
 
@@ -4469,20 +4454,6 @@ static iree_status_t iree_hal_amdxdna_native_submit_wait(
           static_cast<int>(s->label_size), s->label, packet->state,
           chain_data->error_index, chain_data->submit_index);
     }
-    HRXRDBG("ert_FAIL: label='%.*s' state=%u ctx=%p owner_ctx=%p "
-            "owner_match=%d code_staged=%d staged_sz=0x%llx ctrl_sz=0x%llx "
-            "code_off=0x%llx cap=0x%llx active_ranges=%zu",
-            static_cast<int>(s->label_size), s->label, packet->state,
-            (void*)queue->context,
-            (void*)command->pathb_single_code_owner_context,
-            (command->pathb_single_code_owner_context == queue->context) ? 1
-                                                                         : 0,
-            command->pathb_code_staged ? 1 : 0,
-            (unsigned long long)command->pathb_code_staged_size,
-            (unsigned long long)command->control_buffer_size,
-            (unsigned long long)command->pathb_single_code_aperture_offset,
-            (unsigned long long)command->pathb_single_code_aperture_capacity,
-            queue->context->pathb_active_single_code_ranges.size());
     // Displacement signature: the command still owns its staged code on this
     // context yet the dispatch did not complete -> the firmware-resident PDI
     // array was paged out. Mark it recoverable so submit_and_wait can reload
@@ -4528,15 +4499,16 @@ iree_status_t iree_hal_amdxdna_native_queue_submit_and_wait(
     // The dispatch failed because this context's PDI array was displaced.
     // Reload it on a fresh hardware context (KMD-legal recreate) and retry.
     iree_status_ignore(status);
-    HRXRDBG("self_heal: dispatch failed on ctx=%p (displacement); reloading "
-            "PDI + retrying",
-            (void*)queue->context);
+    HRX_SELF_HEAL_LOG(
+        "self_heal: dispatch failed on ctx=%p (displacement); reloading PDI + "
+        "retrying",
+        (void*)queue->context);
     bool pool_exhausted = false;
     iree_status_t reload = iree_hal_amdxdna_native_context_reload_pdi(
         queue->context, &pool_exhausted);
     if (!iree_status_is_ok(reload)) {
-      HRXRDBG("self_heal: reload FAILED on ctx=%p pool_exhausted=%d",
-              (void*)queue->context, pool_exhausted ? 1 : 0);
+      HRX_SELF_HEAL_LOG("self_heal: reload FAILED on ctx=%p pool_exhausted=%d",
+                        (void*)queue->context, pool_exhausted ? 1 : 0);
       return reload;
     }
   }
@@ -4644,9 +4616,10 @@ iree_status_t iree_hal_amdxdna_native_submission_wait(
         !submission->is_pathb_chain_batch &&
         submission->pathb_displacement_recoverable) {
       iree_status_ignore(status);
-      HRXRDBG("self_heal: async dispatch failed on ctx=%p (displacement); "
-              "reloading PDI + re-issuing",
-              (void*)submission->queue->context);
+      HRX_SELF_HEAL_LOG(
+          "self_heal: async dispatch failed on ctx=%p (displacement); reloading "
+          "PDI + re-issuing",
+          (void*)submission->queue->context);
       bool pool_exhausted = false;
       iree_status_t reload = iree_hal_amdxdna_native_context_reload_pdi(
           submission->queue->context, &pool_exhausted);
@@ -4660,8 +4633,9 @@ iree_status_t iree_hal_amdxdna_native_submission_wait(
           status = iree_hal_amdxdna_native_submit_wait(submission);
         }
       } else {
-        HRXRDBG("self_heal: reload FAILED on ctx=%p pool_exhausted=%d",
-                (void*)submission->queue->context, pool_exhausted ? 1 : 0);
+        HRX_SELF_HEAL_LOG("self_heal: reload FAILED on ctx=%p pool_exhausted=%d",
+                          (void*)submission->queue->context,
+                          pool_exhausted ? 1 : 0);
         status = reload;
       }
     }

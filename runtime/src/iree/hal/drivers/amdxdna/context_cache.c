@@ -10,7 +10,6 @@
 
 #include "iree/base/threading/mutex.h"
 #include "iree/hal/drivers/amdxdna/device.h"
-#include "iree/hal/drivers/amdxdna/reclaim_debug.h"
 
 // Bounds how many native hardware contexts the cache keeps alive. The amdxdna
 // driver has only a small, process-global pool of concurrent hardware contexts,
@@ -106,29 +105,35 @@ iree_host_size_t iree_hal_amdxdna_context_cache_resolve_capacity(
   if (override_env && override_env[0]) {
     long parsed = strtol(override_env, NULL, 10);
     if (parsed > 0) {
-      HRXRDBG("resolve_capacity: override -> %ld (budget was %zu)", parsed,
-              hardware_context_budget);
       return (iree_host_size_t)parsed;
     }
   }
-  // Reserve headroom below the reported budget instead of running at the raw
-  // ceiling. Two effects force this:
-  //   1) The architecture table over-reports the usable hardware-context pool on
-  //      some parts (e.g. Strix advertises 32 but the MCDM pool tops out ~26).
-  //   2) D3DKMTDestroyContext publication lag means an evict+create at/near the
-  //      ceiling can transiently over-subscribe the firmware-resident array; the
-  //      KMD then pages out a *live* sibling's array and its next dispatch hangs
-  //      with ert state 5/8. There is no waitable completion to drain that lag,
-  //      so we keep enough headroom that the transient never reaches the ceiling.
-  // Empirically ~5/8 of the reported budget is a clean, fast operating point
-  // (20 of 32 on Strix), validated end-to-end with zero ert_FAIL. The adaptive
-  // clamp in get_or_create is the runtime backstop if a part still needs less.
+  // Default operating point depends on whether the self-heal recreate path is
+  // available on this platform.
+  //
+  // D3DKMTDestroyContext publication lag means an evict+create at/near the pool
+  // ceiling can transiently over-subscribe the firmware-resident array; the KMD
+  // then pages out a *live* sibling's array and its next dispatch hangs with ert
+  // state 5/8. There is no waitable completion to drain that lag.
+  //
+  //   * Windows: the self-heal recreate path (native_windows_mcdm.cc) detects
+  //     that displacement and reloads the context on fresh hardware, so we can
+  //     run at the driver-reported pool ceiling for maximum reuse/throughput.
+  //   * Elsewhere: there is no self-heal, so we reserve headroom (~5/8 of the
+  //     reported budget) to keep the transient from ever reaching the ceiling.
+  //     This also absorbs parts whose architecture table over-reports the usable
+  //     pool (e.g. Strix advertises 32 but the MCDM pool tops out ~26).
+  //
+  // The adaptive clamp in get_or_create is the runtime backstop on either path
+  // if a part still needs less than the resolved capacity.
   if (hardware_context_budget != 0) {
+#if defined(_WIN32)
+    return hardware_context_budget;
+#else
     iree_host_size_t headroom_capacity = (hardware_context_budget * 5) / 8;
     if (headroom_capacity == 0) headroom_capacity = hardware_context_budget;
-    HRXRDBG("resolve_capacity: headroom -> %zu (budget was %zu)",
-            headroom_capacity, hardware_context_budget);
     return headroom_capacity;
+#endif  // defined(_WIN32)
   }
   return IREE_HAL_AMDXDNA_CONTEXT_CACHE_DEFAULT_CAPACITY;
 }
@@ -235,12 +240,6 @@ static bool iree_hal_amdxdna_context_cache_evict_lru(
     lru = any_lru;
   }
   if (!lru) return false;
-  HRXRDBG("evict_lru: kernel='%.*s' entry=%p ctx_ref=%p lease_count=%zu "
-          "forced_leased=%d allow_leased=%d count=%zu cap=%zu",
-          (int)lru->kernel_name.size, lru->kernel_name.data, (void*)lru,
-          (void*)lru->context_ref, lru->lease_count,
-          (lru->lease_count > 0) ? 1 : 0, allow_leased ? 1 : 0,
-          context_cache->count, context_cache->capacity);
   if (lru_prev) {
     lru_prev->next = lru->next;
   } else {
@@ -430,12 +429,6 @@ static iree_status_t iree_hal_amdxdna_context_cache_get_or_create_internal(
         /*.kernel_name=*/entry->kernel_name,
     };
     if (iree_hal_amdxdna_context_cache_key_equal(&entry_key, &request_key)) {
-      HRXRDBG("get_or_create: HIT kernel='%.*s' entry=%p ctx_ref=%p "
-              "lease_count=%zu count=%zu cap=%zu want_lease=%d",
-              (int)kernel_name.size, kernel_name.data, (void*)entry,
-              (void*)entry->context_ref, entry->lease_count,
-              context_cache->count, context_cache->capacity,
-              out_lease ? 1 : 0);
       // Cache hit: promote to MRU (front) so the LRU eviction order stays
       // meaningful, then hand out an additional reference to the caller.
       if (prev) {
@@ -535,8 +528,6 @@ static iree_status_t iree_hal_amdxdna_context_cache_get_or_create_internal(
     if (context_cache->count > 1) {
       iree_host_size_t clamped = context_cache->count - 1;
       if (clamped < context_cache->capacity) {
-        HRXRDBG("capacity_clamp: %zu -> %zu (driver pool exhausted at count=%zu)",
-                context_cache->capacity, clamped, context_cache->count);
         context_cache->capacity = clamped;
       }
     }
@@ -571,13 +562,6 @@ static iree_status_t iree_hal_amdxdna_context_cache_get_or_create_internal(
     entry->next = context_cache->head;
     context_cache->head = entry;
     context_cache->count++;
-    HRXRDBG("get_or_create: CREATED kernel='%.*s' entry=%p ctx_ref=%p "
-            "count=%zu cap=%zu heap_recov=%d ctx_recov=%d pool_recov=%d "
-            "want_lease=%d",
-            (int)kernel_name.size, kernel_name.data, (void*)entry,
-            (void*)context_ref, context_cache->count, context_cache->capacity,
-            attempted_heap_recovery ? 1 : 0, attempted_context_recovery ? 1 : 0,
-            attempted_pool_recovery ? 1 : 0, out_lease ? 1 : 0);
     if (out_context_ref) {
       *out_context_ref = iree_hal_amdxdna_context_cache_retain_context(
           context_cache, context_ref);
@@ -649,10 +633,6 @@ iree_hal_amdxdna_context_cache_lease_retain_context(
   if (lease->entry && lease->entry->context_ref) {
     context_ref = iree_hal_amdxdna_context_cache_retain_context(
         context_cache, lease->entry->context_ref);
-  } else {
-    HRXRDBG("lease_retain: FORCE-EVICTED lease=%p entry=%p (returns NULL -> "
-            "dispatch must re-pin)",
-            (void*)lease, (void*)lease->entry);
   }
   iree_slim_mutex_unlock(&context_cache->mutex);
   return context_ref;

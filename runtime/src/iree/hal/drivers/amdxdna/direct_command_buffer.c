@@ -18,7 +18,6 @@
 #include "iree/hal/drivers/amdxdna/direct_command_buffer_chain_cache.h"
 #include "iree/hal/drivers/amdxdna/direct_command_buffer_planning.h"
 #include "iree/hal/drivers/amdxdna/direct_command_buffer_single_cache.h"
-#include "iree/hal/drivers/amdxdna/reclaim_debug.h"
 #include "iree/hal/drivers/amdxdna/dispatch.h"
 #include "iree/hal/drivers/amdxdna/executable_internal.h"
 #include "iree/hal/drivers/amdxdna/util.h"
@@ -3134,17 +3133,8 @@ iree_status_t iree_hal_amdxdna_direct_command_buffer_dispatch_plan(
             kernel_params->cached_context_lease);
         if (context_ref) {
           cu_idx = kernel_params->cached_cu_index;
-          HRXRDBG("dispatch: REUSE-LEASE kernel='%.*s' ctx_ref=%p cu=%u "
-                  "lease=%p",
-                  (int)plan->kernel_name.size, plan->kernel_name.data,
-                  (void*)context_ref, (unsigned)cu_idx.index,
-                  (void*)kernel_params->cached_context_lease);
         } else {
           // LRU force-evicted this leased context; re-pin below.
-          HRXRDBG("dispatch: LEASE-STALE kernel='%.*s' lease=%p -> re-pin "
-                  "(context was force-evicted)",
-                  (int)plan->kernel_name.size, plan->kernel_name.data,
-                  (void*)kernel_params->cached_context_lease);
           iree_hal_amdxdna_context_cache_lease_release(
               kernel_params->cached_context_lease);
           kernel_params->cached_context_lease = NULL;
@@ -3165,15 +3155,6 @@ iree_status_t iree_hal_amdxdna_direct_command_buffer_dispatch_plan(
           context_lease = NULL;
           kernel_params->cached_cu_index = cu_idx;
           kernel_params->cached_context_valid = true;
-          HRXRDBG("dispatch: RE-PIN-OK kernel='%.*s' ctx_ref=%p cu=%u "
-                  "lease=%p (fresh context; needs code re-stage)",
-                  (int)plan->kernel_name.size, plan->kernel_name.data,
-                  (void*)context_ref, (unsigned)cu_idx.index,
-                  (void*)kernel_params->cached_context_lease);
-        } else {
-          HRXRDBG("dispatch: RE-PIN-FAIL kernel='%.*s' status=%d",
-                  (int)plan->kernel_name.size, plan->kernel_name.data,
-                  (int)iree_status_code(status));
         }
         iree_hal_amdxdna_context_cache_lease_release(context_lease);
       }
