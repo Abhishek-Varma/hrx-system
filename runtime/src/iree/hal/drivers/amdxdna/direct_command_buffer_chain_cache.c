@@ -141,6 +141,14 @@ iree_hal_amdxdna_chain_command_cache_total_resources(
   return total;
 }
 
+iree_host_size_t iree_hal_amdxdna_chain_command_cache_total_instruction_bytes(
+    const iree_hal_amdxdna_device_chain_command_cache_t* cache) {
+  if (!cache) return 0;
+  return (iree_host_size_t)iree_hal_amdxdna_chain_command_cache_total_resources(
+             cache)
+      .instruction_bytes;
+}
+
 static iree_hal_amdxdna_chain_command_cache_entry_t*
 iree_hal_amdxdna_chain_command_cache_find_empty_entry(
     iree_hal_amdxdna_device_chain_command_cache_t* cache) {

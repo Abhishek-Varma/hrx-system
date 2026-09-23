@@ -305,6 +305,13 @@ void iree_hal_amdxdna_chain_command_cache_evict_idle(
 void iree_hal_amdxdna_chain_command_cache_evict_idle_locked(
     iree_hal_amdxdna_device_chain_command_cache_t* cache);
 
+// Returns the summed instruction-word footprint currently retained by all
+// entries (the same accounting the fit/trim budget uses). The caller must hold
+// cache->mutex. Used to translate a real DEV-heap overshoot into how far the
+// accounted ceiling must drop so trim evicts idle entries proactively.
+iree_host_size_t iree_hal_amdxdna_chain_command_cache_total_instruction_bytes(
+    const iree_hal_amdxdna_device_chain_command_cache_t* cache);
+
 // Always re-map a cached control-code BO before rewriting it.
 //
 // Windows instruction BOs start as deferred host storage. The first submit

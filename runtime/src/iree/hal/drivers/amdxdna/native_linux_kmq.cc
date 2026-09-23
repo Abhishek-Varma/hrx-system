@@ -116,7 +116,25 @@ constexpr size_t kMaxExecBoSize = 4096;
 // Linux KMQ allocates instruction and PDI BOs from one process-wide device
 // heap. Keep one command-construction reserve outside retained cache budgets.
 constexpr uint32_t kSharedCodeMemoryBytes = 64u * 1024u * 1024u;
-constexpr uint32_t kSharedCodeMemoryMissReserveBytes = 4u * 1024u * 1024u;
+// Free window kept outside the retained command caches so a fresh command chain
+// *and* a fresh hardware context can be constructed without tripping the device
+// heap's ENOSPC limit. The heap is nominally 64 MiB, but on-device measurement
+// (see live_dev_heap_bytes) shows AMDXDNA_BO_DEV allocation on this KMD/part
+// starts failing once live DEV-heap occupancy reaches only ~36-46 MiB: the
+// driver's drm_mm heap cannot place even a 32-330 KiB BO although megabytes are
+// nominally free, because a many-model sweep fragments the heap into sub-BO
+// holes and the cliff moves lower the more small BOs are resident. The lowest
+// failure we captured was a 33 KiB *PDI* BO (allocated inside hardware-context
+// creation, on top of the retained command caches) failing at ~36.8 MiB live
+// occupancy. So the effective usable budget is well under the nominal size, and
+// the reserve must also cover the per-context PDI/command BOs a create allocates
+// beyond the cached-command accounting. Reserving 34 MiB keeps live occupancy at
+// ~30 MiB, leaving ~7 MiB of headroom below the observed cliff for a context
+// create's burst, and the chain cache self-trims idle entries against this
+// reserve so a new build's first-try allocation succeeds. This is the proactive
+// alternative to the old "allocation failed, drop idle caches and retry"
+// recovery, which we deliberately avoid.
+constexpr uint32_t kSharedCodeMemoryMissReserveBytes = 34u * 1024u * 1024u;
 
 // The exec BO is large enough to hold many chain slots, but XRT's runlist
 // implementation chunks native command chains at 24 children. Match that
@@ -691,6 +709,9 @@ iree_status_t iree_hal_amdxdna_native_device_alloc_buffer(
         " flags=0x%08x errno %d",
         (int)type, (uint64_t)size, to_shim_buffer_flags(type), normalized_err);
   }
+  // DEV-heap accounting is maintained by the shim bo layer (pdev), which sees
+  // both these HAL instruction BOs and the shim-internal PDI/command BOs, so no
+  // per-buffer bookkeeping is needed here.
   *out_buffer = new iree_hal_amdxdna_native_buffer_t(std::move(bo));
   return iree_ok_status();
 }
@@ -1510,6 +1531,17 @@ iree_hal_amdxdna_native_device_c_live_context_image_bytes(
   return device
              ? device->live_context_image_bytes.load(std::memory_order_relaxed)
              : 0;
+}
+
+extern "C" iree_host_size_t
+iree_hal_amdxdna_native_device_c_live_dev_heap_bytes(
+    iree_hal_amdxdna_native_device_t* device) {
+  if (!device || !device->shim_device) return 0;
+  // Exact driver-side occupancy of the shared 64MiB DEV heap: every live
+  // AMDXDNA_BO_DEV buffer (HAL instruction BOs plus shim-internal PDI/command
+  // BOs), page-rounded to match the driver's allocator. This supersedes the
+  // per-counter reconstruction, which missed the shim-internal BOs.
+  return (iree_host_size_t)device->shim_device->get_dev_heap_used_bytes();
 }
 
 extern "C" iree_hal_amdxdna_native_context_t*
