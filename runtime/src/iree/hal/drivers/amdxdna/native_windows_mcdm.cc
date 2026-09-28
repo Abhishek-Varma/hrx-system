@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -448,6 +449,43 @@ struct iree_hal_amdxdna_native_device_t {
   uint32_t virtual_context_budget = 0;
   iree_hal_amdxdna_native_c_driver_stack_t driver_stack = {};
 };
+
+// Queries the WDDM per-process video-memory budget/usage for this device's
+// adapter. This is the Windows analog of the Linux shared DEV-heap accounting:
+// on Windows the amdxdna caches (contexts, command chains) and model buffers are
+// independent KMT allocations that all draw from one per-process WDDM video-
+// memory budget, so the budget/usage pair lets the platform-agnostic proactive
+// trim bound the retained caches against real device pressure. Prefers the LOCAL
+// segment (device-resident carveout) and falls back to NON_LOCAL when the
+// platform reports no local budget (APU shared-memory topologies). Returns false
+// when the query is unavailable, so callers fall back to the count-only bound.
+static bool iree_hal_amdxdna_native_windows_query_video_memory(
+    const iree_hal_amdxdna_native_device_t* device, uint64_t* out_budget,
+    uint64_t* out_current_usage) {
+  if (out_budget) *out_budget = 0;
+  if (out_current_usage) *out_current_usage = 0;
+  if (!device || !device->api.query_video_memory_info ||
+      device->device.adapter == 0) {
+    return false;
+  }
+  const D3DKMT_MEMORY_SEGMENT_GROUP groups[] = {
+      D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL,
+      D3DKMT_MEMORY_SEGMENT_GROUP_NON_LOCAL};
+  for (D3DKMT_MEMORY_SEGMENT_GROUP group : groups) {
+    D3DKMT_QUERYVIDEOMEMORYINFO info = {};
+    info.hProcess = nullptr;
+    info.hAdapter = device->device.adapter;
+    info.MemorySegmentGroup = group;
+    info.PhysicalAdapterIndex = 0;
+    const NTSTATUS status = device->api.query_video_memory_info(&info);
+    if (status == 0 && info.Budget != 0) {
+      if (out_budget) *out_budget = info.Budget;
+      if (out_current_usage) *out_current_usage = info.CurrentUsage;
+      return true;
+    }
+  }
+  return false;
+}
 
 struct iree_hal_amdxdna_native_buffer_t {
   iree_hal_amdxdna_native_device_t* device = nullptr;
@@ -2628,10 +2666,48 @@ iree_status_t iree_hal_amdxdna_native_device_query_caps(
   caps.max_hardware_contexts =
       iree_hal_amdxdna_native_windows_hardware_context_cache_capacity(
           device->virtual_context_budget, &driver_identity);
-  // Prepared commands and context images are independent KMT allocations, not
-  // consumers of one bounded allocation domain.
-  caps.max_shared_code_memory_bytes = 0;
-  caps.shared_code_memory_miss_reserve_bytes = 0;
+  // Prepared commands, context images, and model buffers are independent KMT
+  // allocations, but they all draw from the same per-process WDDM video-memory
+  // budget. Under a many-model sweep the retained amdxdna caches accumulate
+  // until a model load's device allocation fails (hrx_buffer_allocate) and the
+  // failure cascades. Publish the WDDM budget as the shared code-memory bound so
+  // the platform-agnostic proactive trim (context_cache.c / direct_command_buffer.c,
+  // gated on this being non-zero) drops idle command caches against measured
+  // occupancy before each context create. This is the Windows analog of the
+  // Linux 64MiB DEV-heap accounting; when the WDDM query is unavailable we fall
+  // back to the previous count-only behavior (0 disables the memory bound).
+  // max_shared_code_memory_bytes is a uint32 field (it was sized for the Linux
+  // 64MiB heap), so it cannot hold the multi-GB per-process WDDM budget and is
+  // not meant to: it bounds the *reclaimable* amdxdna cache footprint (context
+  // images + command BOs), not total device memory. Clamp to a device-memory
+  // slice that fits the field and stays well under the real WDDM ceiling, so the
+  // static context-image/command budgets keep cached code bounded and the
+  // proactive trim leaves ample headroom for a model load's allocation burst.
+  static const uint64_t kWindowsCodeMemoryCapBytes = 3072ull * 1024ull * 1024ull;
+  uint64_t wddm_budget = 0;
+  if (iree_hal_amdxdna_native_windows_query_video_memory(device, &wddm_budget,
+                                                         /*out_current_usage=*/
+                                                         nullptr) &&
+      wddm_budget != 0) {
+    const uint64_t bound = wddm_budget < kWindowsCodeMemoryCapBytes
+                               ? wddm_budget
+                               : kWindowsCodeMemoryCapBytes;
+    caps.max_shared_code_memory_bytes = (uint32_t)bound;
+    // Hold back ~1/8 of the bound so the trim fires before a load's allocation
+    // burst. Used as the single-miss construction reserve and (doubled) as the
+    // command working-set reserve in the context-image budget derivation.
+    caps.shared_code_memory_miss_reserve_bytes = (uint32_t)(bound / 8u);
+  } else {
+    caps.max_shared_code_memory_bytes = 0;
+    caps.shared_code_memory_miss_reserve_bytes = 0;
+  }
+  fprintf(stderr,
+          "[amdxdna] Windows shared-code-memory bound: budget=%llu MiB "
+          "reserve=%llu MiB\n",
+          (unsigned long long)(caps.max_shared_code_memory_bytes /
+                               (1024ull * 1024ull)),
+          (unsigned long long)(caps.shared_code_memory_miss_reserve_bytes /
+                               (1024ull * 1024ull)));
   caps.context_image_models =
       IREE_HAL_AMDXDNA_NATIVE_C_CONTEXT_IMAGE_MODEL_XCLBIN;
   caps.dispatch_models = IREE_HAL_AMDXDNA_NATIVE_C_DISPATCH_MODEL_START_CU |
@@ -4700,6 +4776,22 @@ iree_hal_amdxdna_native_device_c_live_context_image_bytes(
     iree_hal_amdxdna_native_device_t* device) {
   (void)device;
   return 0;
+}
+
+extern "C" iree_host_size_t iree_hal_amdxdna_native_device_c_live_dev_heap_bytes(
+    iree_hal_amdxdna_native_device_t* device) {
+  // Real per-process device-memory occupancy (WDDM CurrentUsage), the Windows
+  // analog of the Linux shared DEV-heap counter. The proactive trim compares
+  // this against the published budget (see query_caps) to drop idle command
+  // caches before a model load's allocation would otherwise exhaust device
+  // memory and cascade. Returns 0 when the query is unavailable, which disables
+  // the occupancy-driven trim per the native.h contract.
+  uint64_t current_usage = 0;
+  if (!iree_hal_amdxdna_native_windows_query_video_memory(
+          device, /*out_budget=*/nullptr, &current_usage)) {
+    return 0;
+  }
+  return (iree_host_size_t)current_usage;
 }
 
 extern "C" iree_hal_amdxdna_native_context_t*

@@ -6,6 +6,7 @@
 
 #include <sys/types.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -36,6 +37,13 @@ struct pdev {
   mutable int m_dev_fd = -1;
   mutable std::unique_ptr<bo> m_dev_heap_bo;
   int m_init_errno = 0;
+  // Live bytes suballocated from the 64 MiB DEV heap (AMDXDNA_BO_DEV), rounded
+  // to the driver's 32 KiB allocation quantum (dev_mem_buf_shift=15) so it mirrors
+  // real drm_mm address-space consumption. Maintained by bo alloc/free so the HAL
+  // sees the driver's real heap occupancy -- HAL instruction BOs plus shim-internal
+  // PDI/command BOs -- and can trim retained caches before the heap fills. Excludes
+  // the 64 MiB DEV_HEAP container BO and non-heap SHMEM/CMD BOs.
+  mutable std::atomic<uint64_t> m_dev_heap_used_bytes{0};
 
   pdev();
   explicit pdev(const std::filesystem::path& device_path);
@@ -72,6 +80,12 @@ struct device {
   int init_errno() const;
 
   const pdev& get_pdev() const;
+
+  // Live occupancy of the 64 MiB DEV heap, rounded to the driver's 32 KiB
+  // allocation quantum so it matches the real drm_mm footprint the heap allocator
+  // enforces, letting callers bound retained command code/context images against
+  // measured pressure regardless of BO size mix.
+  uint64_t get_dev_heap_used_bytes() const;
 
   int alloc_bo(uint32_t ctx_id, size_t size, shim_amdxdna_bo_flags flags,
                std::unique_ptr<bo>* out_bo);

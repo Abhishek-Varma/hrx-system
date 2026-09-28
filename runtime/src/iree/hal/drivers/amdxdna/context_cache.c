@@ -11,6 +11,13 @@
 #include "iree/base/threading/mutex.h"
 #include "iree/hal/drivers/amdxdna/device.h"
 
+// Extra shared-DEV-heap headroom (beyond the incoming context image estimate)
+// that a hardware-context create needs for the PDI/command BOs it allocates
+// internally, plus slack for drm_mm fragmentation. Used to decide whether to
+// proactively drop idle command caches before creating a context so the create's
+// device-heap allocations land first-try instead of tripping ENOSPC.
+#define IREE_HAL_AMDXDNA_CONTEXT_CREATE_BURST_RESERVE_BYTES (8u * 1024u * 1024u)
+
 // Bounds how many native hardware contexts the cache keeps alive. The amdxdna
 // driver has only a small, process-global pool of concurrent hardware contexts,
 // so an unbounded cache exhausts it after enough distinct kernels. On overflow
@@ -44,6 +51,10 @@ struct iree_hal_amdxdna_device_context_cache_t {
   iree_hal_amdxdna_context_cache_entry_t* head;
   iree_host_size_t count;
   iree_host_size_t capacity;
+  // Ceiling on cumulative resident context-image bytes (pdi + xclbin) across
+  // cached entries. 0 disables the memory bound (count-only behavior). See
+  // iree_hal_amdxdna_context_cache_set_context_image_budget.
+  iree_host_size_t context_image_budget_bytes;
   iree_hal_amdxdna_context_cache_ops_t ops;
   void* ops_user_data;
 };
@@ -278,17 +289,56 @@ void iree_hal_amdxdna_device_context_cache_clear(
   }
 }
 
-iree_host_size_t iree_hal_amdxdna_context_cache_cached_image_bytes(
+static iree_host_size_t iree_hal_amdxdna_context_cache_cached_image_bytes_locked(
     iree_hal_amdxdna_device_context_cache_t* context_cache) {
-  if (!context_cache) return 0;
   iree_host_size_t total = 0;
-  iree_slim_mutex_lock(&context_cache->mutex);
   for (iree_hal_amdxdna_context_cache_entry_t* entry = context_cache->head;
        entry; entry = entry->next) {
     total += entry->pdi.data_length + entry->xclbin.data_length;
   }
+  return total;
+}
+
+iree_host_size_t iree_hal_amdxdna_context_cache_cached_image_bytes(
+    iree_hal_amdxdna_device_context_cache_t* context_cache) {
+  if (!context_cache) return 0;
+  iree_slim_mutex_lock(&context_cache->mutex);
+  iree_host_size_t total =
+      iree_hal_amdxdna_context_cache_cached_image_bytes_locked(context_cache);
   iree_slim_mutex_unlock(&context_cache->mutex);
   return total;
+}
+
+void iree_hal_amdxdna_context_cache_set_context_image_budget(
+    iree_hal_amdxdna_device_context_cache_t* context_cache,
+    iree_host_size_t budget_bytes) {
+  if (!context_cache) return;
+  iree_slim_mutex_lock(&context_cache->mutex);
+  context_cache->context_image_budget_bytes = budget_bytes;
+  iree_slim_mutex_unlock(&context_cache->mutex);
+}
+
+// Evicts idle (unleased) LRU contexts until admitting |incoming_image_bytes|
+// would keep the resident context-image footprint within the configured budget,
+// or until no idle entry remains. Never force-evicts a leased/in-flight context:
+// tearing down a context that hardware still references can wedge the NPU, so a
+// budget that can only be met by dropping a live context is intentionally left
+// unmet here (the caller proceeds, and the already-bounded command caches trim
+// or the native allocator reports a clean, recoverable error). Caller must hold
+// the cache mutex.
+static void iree_hal_amdxdna_context_cache_evict_idle_for_image_budget_locked(
+    iree_hal_amdxdna_device_context_cache_t* context_cache,
+    iree_host_size_t incoming_image_bytes) {
+  if (context_cache->context_image_budget_bytes == 0) return;
+  while (iree_hal_amdxdna_context_cache_cached_image_bytes_locked(
+             context_cache) +
+             incoming_image_bytes >
+         context_cache->context_image_budget_bytes) {
+    if (!iree_hal_amdxdna_context_cache_evict_lru(context_cache,
+                                                  /*allow_leased=*/false)) {
+      break;
+    }
+  }
 }
 
 void iree_hal_amdxdna_context_cache_reclaim(
@@ -435,6 +485,49 @@ static iree_status_t iree_hal_amdxdna_context_cache_get_or_create_internal(
       return iree_make_status(
           IREE_STATUS_RESOURCE_EXHAUSTED,
           "amdxdna context cache capacity is exhausted by leased entries");
+    }
+  }
+
+  // Also bound the resident context-image footprint against the shared device
+  // code-memory heap. Evicting idle LRU contexts here keeps images + reserve
+  // below the heap size so the create below (and later command construction)
+  // never reaches the native allocator's ENOSPC limit. This is proactive by
+  // design: it evicts before the heap fills instead of reacting to an
+  // allocation failure by force-reclaiming in-flight contexts.
+  iree_hal_amdxdna_context_cache_evict_idle_for_image_budget_locked(
+      context_cache, key_pdi.data_length + key_xclbin.data_length);
+
+  // Proactively drop idle command-cache instruction BOs when this context's
+  // image would push live DEV-heap occupancy past the construction reserve. The
+  // context-image eviction above bounds only the image side of the heap; the
+  // command caches (chain/single) draw from the same 64MiB heap, so on a
+  // model-switch a new model's PDI allocation can still trip ENOSPC while idle
+  // command code from the previous model sits resident. Trimming it here, before
+  // the create, keeps the first-try allocation inside the heap. Idle-only (the
+  // hook never evicts in-flight/leased command entries), so it cannot wedge the
+  // NPU, and it is the proactive counterpart to the reactive retry below.
+  if (context_cache->ops.reclaim_create_unavailable &&
+      context_cache->ops.max_shared_code_memory_bytes != 0) {
+    const iree_host_size_t max_bytes =
+        context_cache->ops.max_shared_code_memory_bytes;
+    const iree_host_size_t reserve_bytes =
+        context_cache->ops.shared_code_memory_miss_reserve_bytes;
+    const iree_host_size_t target_bytes =
+        max_bytes > reserve_bytes ? max_bytes - reserve_bytes : 0;
+    // A hardware-context create allocates PDI/command BOs on the shared DEV heap
+    // beyond this image-data estimate (page rounding, multiple internal BOs, and
+    // the xclbin), and drm_mm fragmentation lowers the usable cliff further. The
+    // captured failure was a 33 KiB PDI BO created while live occupancy sat right
+    // at the target. Add a burst allowance so the trim fires *before* the create
+    // starts allocating, leaving room for its whole footprint first-try.
+    const iree_host_size_t incoming_bytes =
+        key_pdi.data_length + key_xclbin.data_length +
+        IREE_HAL_AMDXDNA_CONTEXT_CREATE_BURST_RESERVE_BYTES;
+    const iree_host_size_t used_bytes =
+        iree_hal_amdxdna_native_device_c_live_dev_heap_bytes(native_device);
+    if (used_bytes + incoming_bytes > target_bytes) {
+      context_cache->ops.reclaim_create_unavailable(
+          context_cache->ops_user_data);
     }
   }
 
