@@ -9,7 +9,9 @@
 #include <string.h>
 
 #include "iree/base/threading/mutex.h"
+#include "iree/base/time.h"
 #include "iree/hal/drivers/amdxdna/device.h"
+#include "iree/hal/drivers/amdxdna/hrx_prof.h"
 
 // Bounds how many native hardware contexts the cache keeps alive. The amdxdna
 // driver has only a small, process-global pool of concurrent hardware contexts,
@@ -34,7 +36,29 @@ typedef struct iree_hal_amdxdna_context_cache_entry_t {
   iree_host_size_t lease_count;
   iree_hal_amdxdna_context_cache_lease_t* leases;
   struct iree_hal_amdxdna_context_cache_entry_t* next;
+  // Raw pointers of the original request context-image spans this entry was
+  // created from (NOT the owned copies above). The executable owns these blobs
+  // and reuses the same pointer across tokens, so a pointer+length+name match
+  // against a later request implies identical content. This lets the lookup
+  // skip the full-blob memcmp on the hot path (env HRX_CTX_FASTKEY). Pointer
+  // match => identical blob => identical resolved context, so enabling it
+  // cannot change which hardware context a dispatch runs on.
+  const void* src_pdi_data;
+  const void* src_xclbin_data;
 } iree_hal_amdxdna_context_cache_entry_t;
+
+// Opt-in (HRX_CTX_FASTKEY=1): accelerate the context-cache lookup with a
+// request-pointer-identity fast path before the content memcmp. Read once.
+static bool iree_hal_amdxdna_ctx_fastkey_enabled(void) {
+  static int cached = -1;
+  int v = cached;
+  if (v < 0) {
+    const char* e = getenv("HRX_CTX_FASTKEY");
+    v = (e && e[0] && e[0] != '0') ? 1 : 0;
+    cached = v;
+  }
+  return v != 0;
+}
 
 // Entries form a singly-linked most-recently-used list: `head` is the MRU entry
 // and the tail is the LRU eviction target. A cache hit moves the entry to the
@@ -476,20 +500,39 @@ static iree_status_t iree_hal_amdxdna_context_cache_get_or_create_internal(
       /*.partition_cols=*/partition_cols,
   };
 
+  const bool fastkey = iree_hal_amdxdna_ctx_fastkey_enabled();
   iree_slim_mutex_lock(&context_cache->mutex);
+  const int64_t _hrx_lk = hrx_prof_t0();
   iree_hal_amdxdna_context_cache_entry_t* prev = NULL;
   for (iree_hal_amdxdna_context_cache_entry_t* entry = context_cache->head;
        entry; prev = entry, entry = entry->next) {
-    const iree_hal_amdxdna_context_cache_key_t entry_key = {
-        /*.pdi=*/iree_make_const_byte_span(entry->pdi.data,
-                                           entry->pdi.data_length),
-        /*.xclbin=*/
-        iree_make_const_byte_span(entry->xclbin.data,
-                                  entry->xclbin.data_length),
-        /*.kernel_name=*/entry->kernel_name,
-        /*.partition_cols=*/entry->partition_cols,
-    };
-    if (iree_hal_amdxdna_context_cache_key_equal(&entry_key, &request_key)) {
+    // Fast path: the executable reuses the same context-image blob pointer
+    // across tokens, so a request-pointer + length + name + partition match is
+    // sufficient to identify the entry without the full-blob content memcmp.
+    // A pointer match implies identical content, so the resolved context is
+    // identical to what the content compare would return.
+    bool is_hit;
+    if (fastkey && request_key.pdi.data == entry->src_pdi_data &&
+        request_key.pdi.data_length == entry->pdi.data_length &&
+        request_key.xclbin.data == entry->src_xclbin_data &&
+        request_key.xclbin.data_length == entry->xclbin.data_length &&
+        request_key.partition_cols == entry->partition_cols &&
+        iree_string_view_equal(request_key.kernel_name, entry->kernel_name)) {
+      is_hit = true;
+    } else {
+      const iree_hal_amdxdna_context_cache_key_t entry_key = {
+          /*.pdi=*/iree_make_const_byte_span(entry->pdi.data,
+                                             entry->pdi.data_length),
+          /*.xclbin=*/
+          iree_make_const_byte_span(entry->xclbin.data,
+                                    entry->xclbin.data_length),
+          /*.kernel_name=*/entry->kernel_name,
+          /*.partition_cols=*/entry->partition_cols,
+      };
+      is_hit = iree_hal_amdxdna_context_cache_key_equal(&entry_key,
+                                                        &request_key);
+    }
+    if (is_hit) {
       // Cache hit: promote to MRU (front) so the LRU eviction order stays
       // meaningful, then hand out an additional reference to the caller.
       if (prev) {
@@ -511,10 +554,15 @@ static iree_status_t iree_hal_amdxdna_context_cache_get_or_create_internal(
           *out_context_ref = NULL;
         }
       }
+      hrx_prof_add(HRX_PROF_CTX_LOOKUP, _hrx_lk);
+      hrx_prof_note_ctx(/*hit=*/1);
       iree_slim_mutex_unlock(&context_cache->mutex);
       return status;
     }
   }
+  hrx_prof_add(HRX_PROF_CTX_LOOKUP, _hrx_lk);
+  hrx_prof_note_ctx(/*hit=*/0);
+  const int64_t _hrx_cr = hrx_prof_t0();
 
   // Make room before creating so we never momentarily exceed the cap, which on
   // an already-full driver pool would itself fail. Eviction drops only the
@@ -645,6 +693,10 @@ static iree_status_t iree_hal_amdxdna_context_cache_get_or_create_internal(
   if (iree_status_is_ok(status)) {
     entry->context_ref = context_ref;
     entry->partition_cols = partition_cols;
+    // Remember the original request span pointers for the HRX_CTX_FASTKEY
+    // pointer-identity lookup fast path (see struct comment).
+    entry->src_pdi_data = key_pdi.data;
+    entry->src_xclbin_data = key_xclbin.data;
     entry->next = context_cache->head;
     context_cache->head = entry;
     context_cache->count++;
@@ -674,6 +726,7 @@ static iree_status_t iree_hal_amdxdna_context_cache_get_or_create_internal(
             "amdxdna context cache capacity is exhausted by leased entries");
       }
     }
+    hrx_prof_add(HRX_PROF_CTX_CREATE, _hrx_cr);
     iree_slim_mutex_unlock(&context_cache->mutex);
     return status;
   }

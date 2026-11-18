@@ -11,8 +11,10 @@
 #include <string.h>
 
 #include "iree/base/internal/arena.h"
+#include "iree/base/time.h"
 #include "iree/hal/drivers/amdxdna/direct_command_buffer.h"
 #include "iree/hal/drivers/amdxdna/dispatch.h"
+#include "iree/hal/drivers/amdxdna/hrx_prof.h"
 #include "iree/hal/utils/resource_set.h"
 
 typedef enum iree_hal_amdxdna_cmd_type_e {
@@ -575,9 +577,12 @@ static iree_status_t iree_hal_amdxdna_apply_dispatch(
       .count = cmd->bindings.count,
       .values = binding_refs,
   };
-  return iree_hal_amdxdna_direct_command_buffer_dispatch_plan(
+  int64_t _hrx_t = hrx_prof_t0();
+  iree_status_t _hrx_st = iree_hal_amdxdna_direct_command_buffer_dispatch_plan(
       target_command_buffer, &cmd->plan, cmd->constants, binding_ref_list,
       cmd->flags);
+  hrx_prof_add(HRX_PROF_DISPATCH_PLAN, _hrx_t);
+  return _hrx_st;
 }
 
 typedef iree_status_t (*iree_hal_amdxdna_cmd_apply_fn_t)(
@@ -606,6 +611,8 @@ iree_status_t iree_hal_amdxdna_command_buffer_apply(
 
   iree_hal_amdxdna_command_buffer_t* command_buffer =
       iree_hal_amdxdna_command_buffer_cast(base_command_buffer);
+  hrx_prof_mark_flush();
+  int64_t _hrx_t_apply = hrx_prof_t0();
   iree_status_t status = iree_hal_command_buffer_begin(target_command_buffer);
   if (iree_status_is_ok(status)) {
     for (iree_hal_amdxdna_cmd_header_t* cmd = command_buffer->cmd_list.head;
@@ -615,8 +622,11 @@ iree_status_t iree_hal_amdxdna_command_buffer_apply(
       if (!iree_status_is_ok(status)) break;
     }
   }
+  hrx_prof_add(HRX_PROF_APPLY_LOOP, _hrx_t_apply);
   if (iree_status_is_ok(status)) {
+    const int64_t _hrx_end = hrx_prof_t0();
     status = iree_hal_command_buffer_end(target_command_buffer);
+    hrx_prof_add(HRX_PROF_CB_END, _hrx_end);
   }
   if (iree_status_is_ok(status) &&
       iree_all_bits_set(command_buffer->base.mode,
@@ -646,3 +656,234 @@ static const iree_hal_command_buffer_vtable_t
         .collective = iree_hal_amdxdna_command_buffer_collective,
         .dispatch = iree_hal_amdxdna_command_buffer_dispatch,
 };
+
+//===----------------------------------------------------------------------===//
+// HRX submit-path profiler (env-gated; see hrx_prof.h)
+//===----------------------------------------------------------------------===//
+
+#include <signal.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct hrx_prof_entry_t {
+  _Atomic uint64_t count;
+  _Atomic int64_t total_ns;
+  _Atomic uint64_t bytes;
+} hrx_prof_entry_t;
+
+static hrx_prof_entry_t g_hrx_prof[HRX_PROF_BUCKET_COUNT];
+static _Atomic uint64_t g_hrx_prof_flushes;
+static _Atomic uint64_t g_hrx_rw_total;        // single-cache hits examined
+static _Atomic uint64_t g_hrx_rw_ctrl_changed;  // ... control code re-patched
+static _Atomic uint64_t g_hrx_rw_bind_changed;  // ... bindings rebound
+static _Atomic uint64_t g_hrx_rw_txn_changed;   // ... template replaced
+static _Atomic uint64_t g_hrx_ctx_hits;         // context-cache lookup hits
+static _Atomic uint64_t g_hrx_ctx_misses;       // context-cache lookup misses
+static _Atomic uint64_t g_hrx_chain_exact;      // chain reuse: exact hit
+static _Atomic uint64_t g_hrx_chain_template;   // chain reuse: template hit
+static _Atomic uint64_t g_hrx_chain_device;     // chain reuse: device hit
+static _Atomic uint64_t g_hrx_chain_partial;    // chain reuse: partial-elf hit
+static _Atomic uint64_t g_hrx_chain_miss;       // chain full rebuild (miss)
+static _Atomic uint64_t g_hrx_exec_hit;         // executable reuse hit
+static _Atomic uint64_t g_hrx_exec_miss;        // executable reuse miss (built)
+static _Atomic uint64_t g_hrx_exec_inelig;      // executable not reuse-eligible
+static _Atomic int g_hrx_prof_enabled = -1;  // -1=unknown, 0=off, 1=on
+
+bool hrx_prof_enabled(void) {
+  int e = atomic_load_explicit(&g_hrx_prof_enabled, memory_order_relaxed);
+  if (IREE_UNLIKELY(e < 0)) {
+    const char* v = getenv("HRX_PROF");
+    e = (v && v[0] && v[0] != '0') ? 1 : 0;
+    atomic_store_explicit(&g_hrx_prof_enabled, e, memory_order_relaxed);
+  }
+  return e != 0;
+}
+
+int64_t hrx_prof_t0(void) {
+  return hrx_prof_enabled() ? (int64_t)iree_time_now() : 0;
+}
+
+void hrx_prof_add(hrx_prof_bucket_t b, int64_t start_ns) {
+  if (start_ns == 0 || (unsigned)b >= HRX_PROF_BUCKET_COUNT) return;
+  int64_t d = (int64_t)iree_time_now() - start_ns;
+  atomic_fetch_add_explicit(&g_hrx_prof[b].count, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&g_hrx_prof[b].total_ns, d, memory_order_relaxed);
+}
+
+void hrx_prof_add_bytes(hrx_prof_bucket_t b, uint64_t bytes) {
+  if (!hrx_prof_enabled() || (unsigned)b >= HRX_PROF_BUCKET_COUNT) return;
+  atomic_fetch_add_explicit(&g_hrx_prof[b].bytes, bytes, memory_order_relaxed);
+}
+
+void hrx_prof_mark_flush(void) {
+  if (!hrx_prof_enabled()) return;
+  atomic_fetch_add_explicit(&g_hrx_prof_flushes, 1, memory_order_relaxed);
+}
+
+void hrx_prof_note_chain(int exact_hit, int template_hit, int device_hit,
+                         int partial_hit, int miss_build) {
+  if (!hrx_prof_enabled()) return;
+  if (exact_hit)
+    atomic_fetch_add_explicit(&g_hrx_chain_exact, 1, memory_order_relaxed);
+  if (template_hit)
+    atomic_fetch_add_explicit(&g_hrx_chain_template, 1, memory_order_relaxed);
+  if (device_hit)
+    atomic_fetch_add_explicit(&g_hrx_chain_device, 1, memory_order_relaxed);
+  if (partial_hit)
+    atomic_fetch_add_explicit(&g_hrx_chain_partial, 1, memory_order_relaxed);
+  if (miss_build)
+    atomic_fetch_add_explicit(&g_hrx_chain_miss, 1, memory_order_relaxed);
+}
+
+void hrx_prof_note_exec(int reuse_hit, int reuse_miss, int not_eligible) {
+  if (!hrx_prof_enabled()) return;
+  if (reuse_hit)
+    atomic_fetch_add_explicit(&g_hrx_exec_hit, 1, memory_order_relaxed);
+  if (reuse_miss)
+    atomic_fetch_add_explicit(&g_hrx_exec_miss, 1, memory_order_relaxed);
+  if (not_eligible)
+    atomic_fetch_add_explicit(&g_hrx_exec_inelig, 1, memory_order_relaxed);
+}
+
+void hrx_prof_note_ctx(int hit) {
+  if (!hrx_prof_enabled()) return;
+  if (hit)
+    atomic_fetch_add_explicit(&g_hrx_ctx_hits, 1, memory_order_relaxed);
+  else
+    atomic_fetch_add_explicit(&g_hrx_ctx_misses, 1, memory_order_relaxed);
+}
+
+void hrx_prof_note_rewrite(int control_changed, int bindings_changed,
+                           int txn_changed) {
+  if (!hrx_prof_enabled()) return;
+  atomic_fetch_add_explicit(&g_hrx_rw_total, 1, memory_order_relaxed);
+  if (control_changed)
+    atomic_fetch_add_explicit(&g_hrx_rw_ctrl_changed, 1, memory_order_relaxed);
+  if (bindings_changed)
+    atomic_fetch_add_explicit(&g_hrx_rw_bind_changed, 1, memory_order_relaxed);
+  if (txn_changed)
+    atomic_fetch_add_explicit(&g_hrx_rw_txn_changed, 1, memory_order_relaxed);
+}
+
+static _Atomic int g_hrx_prof_dumped;  // dump exactly once
+
+void hrx_prof_dump(void) {
+  if (!hrx_prof_enabled()) return;
+  int expected = 0;
+  if (!atomic_compare_exchange_strong(&g_hrx_prof_dumped, &expected, 1)) return;
+  static const char* kNames[HRX_PROF_BUCKET_COUNT] = {
+      "apply_loop (per flush)",   "dispatch_plan (per disp)",
+      "normal_run",               "chain_accum",
+      "single_hit_rewrite",       "chain_hit_rewrite",
+      "sync_h2d (ctrl-code DMA)", "submit_ioctl",
+      "ctx_resolve (per disp)",   "get_or_create_context",
+      "open_cu",                  "ctx_lookup (list+cmp)",
+      "ctx_create (miss path)",   "queue_exec_sync (caller)",
+      "op_create (plumbing)",     "issue_ready (apply+submit)",
+      "cb_create (per flush)",    "completion_submit",
+      "cb_release (per flush)",   "cb_end (chain finalize)",
+      "chain_build_miss",
+  };
+  uint64_t flushes = atomic_load(&g_hrx_prof_flushes);
+  fprintf(stderr,
+          "\n================ HRX amdxdna submit-path profile ================\n");
+  fprintf(stderr, "flushes (queue_execute / stream_flush): %llu\n",
+          (unsigned long long)flushes);
+  fprintf(stderr,
+          "%-26s %12s %14s %12s %12s\n", "bucket", "count", "total_ms",
+          "us/call", "MB");
+  for (int i = 0; i < HRX_PROF_BUCKET_COUNT; ++i) {
+    uint64_t c = atomic_load(&g_hrx_prof[i].count);
+    int64_t ns = atomic_load(&g_hrx_prof[i].total_ns);
+    uint64_t by = atomic_load(&g_hrx_prof[i].bytes);
+    double total_ms = (double)ns / 1.0e6;
+    double us_call = c ? ((double)ns / 1.0e3) / (double)c : 0.0;
+    double mb = (double)by / (1024.0 * 1024.0);
+    fprintf(stderr, "%-26s %12llu %14.3f %12.3f %12.2f\n", kNames[i],
+            (unsigned long long)c, total_ms, us_call, mb);
+  }
+  if (flushes) {
+    int64_t apply_ns = atomic_load(&g_hrx_prof[HRX_PROF_APPLY_LOOP].total_ns);
+    fprintf(stderr, "avg apply_loop per flush: %.3f us\n",
+            ((double)apply_ns / 1.0e3) / (double)flushes);
+  }
+  uint64_t cx = atomic_load(&g_hrx_chain_exact);
+  uint64_t ct = atomic_load(&g_hrx_chain_template);
+  uint64_t cd = atomic_load(&g_hrx_chain_device);
+  uint64_t cp = atomic_load(&g_hrx_chain_partial);
+  uint64_t cmiss = atomic_load(&g_hrx_chain_miss);
+  if (cx || ct || cd || cp || cmiss) {
+    fprintf(stderr,
+            "chain finalize tiers: exact=%llu template=%llu device=%llu "
+            "partial_elf=%llu  MISS(rebuild)=%llu\n",
+            (unsigned long long)cx, (unsigned long long)ct,
+            (unsigned long long)cd, (unsigned long long)cp,
+            (unsigned long long)cmiss);
+  }
+  uint64_t eh = atomic_load(&g_hrx_exec_hit);
+  uint64_t em = atomic_load(&g_hrx_exec_miss);
+  uint64_t ei = atomic_load(&g_hrx_exec_inelig);
+  if (eh || em || ei) {
+    fprintf(stderr,
+            "executable_create: reuse_hit=%llu reuse_miss(built)=%llu "
+            "not_eligible(built)=%llu\n",
+            (unsigned long long)eh, (unsigned long long)em,
+            (unsigned long long)ei);
+  }
+  uint64_t ch = atomic_load(&g_hrx_ctx_hits);
+  uint64_t cm = atomic_load(&g_hrx_ctx_misses);
+  if (ch || cm) {
+    fprintf(stderr,
+            "context-cache lookups: %llu  | hits: %llu (%.1f%%)  | misses "
+            "(create): %llu\n",
+            (unsigned long long)(ch + cm), (unsigned long long)ch,
+            100.0 * (double)ch / (double)(ch + cm), (unsigned long long)cm);
+  }
+  uint64_t rw = atomic_load(&g_hrx_rw_total);
+  if (rw) {
+    uint64_t cc = atomic_load(&g_hrx_rw_ctrl_changed);
+    uint64_t bc = atomic_load(&g_hrx_rw_bind_changed);
+    uint64_t tc = atomic_load(&g_hrx_rw_txn_changed);
+    fprintf(stderr,
+            "single-cache hits: %llu  | ctrl_code re-patched: %llu (%.1f%%)  "
+            "| bindings rebound: %llu (%.1f%%)  | template replaced: %llu\n",
+            (unsigned long long)rw, (unsigned long long)cc,
+            100.0 * (double)cc / (double)rw, (unsigned long long)bc,
+            100.0 * (double)bc / (double)rw, (unsigned long long)tc);
+  }
+  fprintf(stderr,
+          "=================================================================\n");
+}
+
+// The HRX engine is known to SIGSEGV during process teardown (after all
+// results print). A plain destructor may not run if that crash fires first, so
+// also dump from a crash handler (and re-raise) to guarantee we capture the
+// profile. Dump is idempotent via g_hrx_prof_dumped.
+static struct sigaction g_hrx_prof_prev_segv;
+static struct sigaction g_hrx_prof_prev_abrt;
+
+static void hrx_prof_crash_handler(int sig, siginfo_t* info, void* ctx) {
+  hrx_prof_dump();
+  struct sigaction* prev =
+      (sig == SIGSEGV) ? &g_hrx_prof_prev_segv : &g_hrx_prof_prev_abrt;
+  sigaction(sig, prev, NULL);
+  (void)info;
+  (void)ctx;
+  raise(sig);
+}
+
+__attribute__((constructor)) static void hrx_prof_install(void) {
+  if (!hrx_prof_enabled()) return;
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_sigaction = hrx_prof_crash_handler;
+  sa.sa_flags = SA_SIGINFO;
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGSEGV, &sa, &g_hrx_prof_prev_segv);
+  sigaction(SIGABRT, &sa, &g_hrx_prof_prev_abrt);
+}
+
+__attribute__((destructor)) static void hrx_prof_atexit(void) {
+  hrx_prof_dump();
+}

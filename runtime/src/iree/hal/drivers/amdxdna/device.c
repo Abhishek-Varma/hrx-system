@@ -15,6 +15,8 @@
 #include "iree/async/util/proactor_pool.h"
 #include "iree/base/internal/atomics.h"
 #include "iree/base/time.h"
+#include "iree/hal/drivers/amdxdna/hrx_prof.h"
+#include "iree/base/time.h"
 #include "iree/hal/drivers/amdxdna/allocator.h"
 #include "iree/hal/drivers/amdxdna/api.h"
 #include "iree/hal/drivers/amdxdna/buffer.h"
@@ -618,10 +620,12 @@ static iree_status_t iree_hal_amdxdna_queue_execute_apply(
   iree_status_t status = iree_ok_status();
   (void)signal_list;
   if (iree_status_is_ok(status)) {
+    const int64_t _hrx_cbc = hrx_prof_t0();
     status = iree_hal_amdxdna_direct_command_buffer_create(
         device, mode, IREE_HAL_COMMAND_CATEGORY_ANY,
         /*binding_capacity=*/0, &device->block_pool, device->host_allocator,
         &direct_command_buffer);
+    hrx_prof_add(HRX_PROF_CB_CREATE, _hrx_cbc);
   }
   if (iree_status_is_ok(status) && completion_batch) {
     iree_hal_amdxdna_direct_command_buffer_set_completion_batch(
@@ -641,10 +645,14 @@ static iree_status_t iree_hal_amdxdna_queue_execute_apply(
       iree_hal_amdxdna_completion_batch_retain_command_buffer(
           completion_batch, direct_command_buffer);
     }
+    const int64_t _hrx_cs = hrx_prof_t0();
     status = iree_hal_amdxdna_completion_batch_submit(completion_batch);
+    hrx_prof_add(HRX_PROF_COMPLETION_SUBMIT, _hrx_cs);
     *out_completion_submitted = true;
   }
+  const int64_t _hrx_cbr = hrx_prof_t0();
   iree_hal_command_buffer_release(direct_command_buffer);
+  hrx_prof_add(HRX_PROF_CB_RELEASE, _hrx_cbr);
   return status;
 }
 
@@ -722,6 +730,7 @@ static iree_status_t iree_hal_amdxdna_device_queue_execute(
     iree_hal_buffer_binding_table_t binding_table,
     iree_hal_execute_flags_t flags) {
   IREE_TRACE_ZONE_BEGIN(z0);
+  const int64_t _hrx_qe = hrx_prof_t0();
   (void)queue_affinity;
 
   iree_hal_amdxdna_device* device = IREE_HAL_AMDXDNA_CHECKED_VTABLE_CAST(
@@ -738,9 +747,11 @@ static iree_status_t iree_hal_amdxdna_device_queue_execute(
   }
 
   if (iree_status_is_ok(status)) {
+    const int64_t _hrx_oc = hrx_prof_t0();
     status = iree_hal_amdxdna_queue_execute_op_create(
         device, command_buffer, validated_binding_table, flags,
         signal_semaphore_list, &op);
+    hrx_prof_add(HRX_PROF_OP_CREATE, _hrx_oc);
     if (iree_status_is_ok(status)) {
       bool completion_batch_owns_signal_list = false;
       iree_hal_semaphore_list_t async_signal_list = signal_semaphore_list;
@@ -758,7 +769,9 @@ static iree_status_t iree_hal_amdxdna_device_queue_execute(
             iree_hal_amdxdna_semaphore_list_is_ready(wait_semaphore_list);
       }
       if (direct_ready_submit) {
+        const int64_t _hrx_ir = hrx_prof_t0();
         status = iree_hal_amdxdna_queue_execute_issue_ready(op);
+        hrx_prof_add(HRX_PROF_ISSUE_READY, _hrx_ir);
         op = NULL;
       } else {
         status = iree_hal_amdxdna_async_queue_enqueue_with_failure_handler(
@@ -794,6 +807,7 @@ static iree_status_t iree_hal_amdxdna_device_queue_execute(
     }
   }
 
+  hrx_prof_add(HRX_PROF_QUEUE_EXEC_SYNC, _hrx_qe);
   IREE_TRACE_ZONE_END(z0);
   return status;
 }

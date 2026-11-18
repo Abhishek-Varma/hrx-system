@@ -16,6 +16,7 @@
 #include "iree/base/threading/mutex.h"
 #include "iree/hal/drivers/amdxdna/device.h"
 #include "iree/hal/drivers/amdxdna/direct_command_buffer_planning.h"
+#include "iree/hal/drivers/amdxdna/hrx_prof.h"
 #include "iree/schemas/amdxdna_xclbin_executable_def_builder.h"
 
 typedef struct hrx_amdxdna_serialization_workspace_t {
@@ -995,6 +996,7 @@ hrx_status_t hrx_amdxdna_executable_create(
   const hrx_amdxdna_xclbin_identity_t* xclbin_identity = NULL;
   if (!hrx_amdxdna_executable_reuse_params(params, &entry_point, &run,
                                            &xclbin_identity)) {
+    hrx_prof_note_exec(0, 0, 1);
     return hrx_amdxdna_executable_load(device, params, executable);
   }
 
@@ -1008,8 +1010,10 @@ hrx_status_t hrx_amdxdna_executable_create(
       iree_hal_amdxdna_device_lookup_reusable_executable(device->hal_device,
                                                          &key.hal_key);
   if (reused_hal_executable) {
+    hrx_prof_note_exec(1, 0, 0);
     status = hrx_executable_wrap_hal(device, reused_hal_executable, executable);
   } else {
+    hrx_prof_note_exec(0, 1, 0);
     status = hrx_amdxdna_executable_load(device, params, executable);
     if (hrx_status_is_ok(status)) {
       iree_hal_amdxdna_device_publish_reusable_executable(
