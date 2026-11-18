@@ -13,6 +13,7 @@
 #include "iree/hal/drivers/amdxdna/context_cache.h"
 #include "iree/hal/drivers/amdxdna/ctrlcode_elf.h"
 #include "iree/hal/drivers/amdxdna/device.h"
+#include "iree/hal/drivers/amdxdna/direct_command_buffer_chain_cache.h"
 #include "iree/hal/drivers/amdxdna/direct_command_buffer_single_cache.h"
 #include "iree/hal/drivers/amdxdna/executable_internal.h"
 #include "iree/hal/drivers/amdxdna/util.h"
@@ -1656,6 +1657,9 @@ static void iree_hal_amdxdna_native_executable_destroy(
   if (hal_device) {
     iree_hal_amdxdna_single_command_cache_retire_executable(
         iree_hal_amdxdna_get_single_command_cache(hal_device),
+        executable->cache_identity);
+    iree_hal_amdxdna_chain_command_cache_retire_executable(
+        iree_hal_amdxdna_get_chain_command_cache(hal_device),
         executable->cache_identity);
   }
   iree_hal_amdxdna_executable_deinitialize(executable);

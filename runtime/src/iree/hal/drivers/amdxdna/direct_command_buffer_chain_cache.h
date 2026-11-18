@@ -241,6 +241,15 @@ void iree_hal_amdxdna_chain_command_cache_invalidate_queue(
     iree_hal_amdxdna_device_chain_command_cache_t* cache,
     iree_hal_amdxdna_native_queue_t* queue);
 
+// Retires every cached chain child recorded from |executable_identity| when
+// that executable is destroyed. Mirrors the single-command cache: the child's
+// identity is zeroed but its cloned control-program template is retained, so a
+// freshly created executable with an identical program can reuse the realized
+// chain by content (ABA-safe), instead of forcing a full chain rebuild.
+void iree_hal_amdxdna_chain_command_cache_retire_executable(
+    iree_hal_amdxdna_device_chain_command_cache_t* cache,
+    uint64_t executable_identity);
+
 bool iree_hal_amdxdna_chain_cmd_descriptor_matches(
     const iree_hal_amdxdna_chain_cmd_t* lhs,
     const iree_hal_amdxdna_chain_cmd_t* rhs);

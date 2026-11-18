@@ -203,6 +203,17 @@ static bool iree_hal_amdxdna_u32_list_equal(
                                          rhs->count);
 }
 
+// Compares only the element counts of two optional u32 lists (NULL == empty).
+// Used for START_NPU template shape matching, where the realized contents are
+// re-patched from the fresh descriptor rather than reused.
+static bool iree_hal_amdxdna_u32_list_lengths_match(
+    const iree_hal_amdxdna_u32_list_t* lhs,
+    const iree_hal_amdxdna_u32_list_t* rhs) {
+  const iree_host_size_t lhs_count = lhs ? lhs->count : 0;
+  const iree_host_size_t rhs_count = rhs ? rhs->count : 0;
+  return lhs_count == rhs_count;
+}
+
 static bool iree_hal_amdxdna_u8_span_equal(const uint8_t* lhs,
                                            iree_host_size_t lhs_count,
                                            const uint8_t* rhs,
@@ -776,6 +787,27 @@ void iree_hal_amdxdna_chain_command_cache_invalidate_queue(
   iree_slim_mutex_unlock(&cache->mutex);
 }
 
+void iree_hal_amdxdna_chain_command_cache_retire_executable(
+    iree_hal_amdxdna_device_chain_command_cache_t* cache,
+    uint64_t executable_identity) {
+  if (!cache || executable_identity == 0) return;
+  iree_slim_mutex_lock(&cache->mutex);
+  for (iree_host_size_t i = 0; i < cache->entry_count; ++i) {
+    iree_hal_amdxdna_chain_command_cache_entry_t* entry = &cache->entries[i];
+    for (iree_host_size_t j = 0; j < entry->group.cmd_count; ++j) {
+      iree_hal_amdxdna_chain_cmd_t* cmd = &entry->group.cmds[j];
+      if (cmd->src_executable_identity != executable_identity) continue;
+      // Zero the identity but keep the cloned src_* template: subsequent
+      // template-match now compares control-program *content*, never the freed
+      // executable-owned pointers (ABA-safe), exactly like the single cache.
+      cmd->src_executable_identity = 0;
+      cmd->src_entry_point = 0;
+      cmd->src_run_ordinal = 0;
+    }
+  }
+  iree_slim_mutex_unlock(&cache->mutex);
+}
+
 bool iree_hal_amdxdna_direct_command_buffer_control_words_changed(
     const uint32_t* cached_words, iree_host_size_t cached_word_count,
     const uint32_t* fresh_words, iree_host_size_t fresh_word_count) {
@@ -961,13 +993,33 @@ bool iree_hal_amdxdna_chain_cmd_descriptor_template_matches(
       lhs->src_run_ordinal == rhs->src_run_ordinal;
   const bool has_immutable_source =
       lhs->src_executable_identity != 0 || rhs->src_executable_identity != 0;
+  // Identity-churn fallback: engines may recreate a logically identical
+  // executable every decode step (fresh cache_identity each token) without
+  // reusing it through the HAL reuse cache, so identity-keyed matching misses
+  // 100% of the time and the realized chain is rebuilt per token even though
+  // only the per-token bindings/constants change. When the identity fast path
+  // does not apply, fall back to a START_NPU control-program *shape* match
+  // (asm template + patch table lengths), identical to the shape check the
+  // same-identity and no-identity branches already trust. Correctness does not
+  // rely on identity here: a template hit re-realizes the on-device control
+  // code and rebinds every buffer from the fresh descriptor in
+  // iree_hal_amdxdna_rewrite_cached_start_npu_cmd, so the retained chain is
+  // fully reprogrammed for this token. Restricted to non-partial-ELF because
+  // that rewrite path requires a deferred START_NPU descriptor.
+  const bool shape_fallback_match =
+      !(lhs->src_use_native_partial_elf || rhs->src_use_native_partial_elf) &&
+      lhs->src_asm_inst && rhs->src_asm_inst &&
+      lhs->src_asm_inst->count == rhs->src_asm_inst->count &&
+      iree_hal_amdxdna_u32_list_lengths_match(lhs->src_patches,
+                                              rhs->src_patches);
   const bool same_template =
       (has_immutable_source && same_immutable_source &&
        (!(lhs->src_use_native_partial_elf || rhs->src_use_native_partial_elf) ||
         (lhs->src_asm_inst && rhs->src_asm_inst &&
          lhs->src_asm_inst->count == rhs->src_asm_inst->count))) ||
       (!has_immutable_source && lhs->src_asm_inst && rhs->src_asm_inst &&
-       lhs->src_asm_inst->count == rhs->src_asm_inst->count);
+       lhs->src_asm_inst->count == rhs->src_asm_inst->count) ||
+      shape_fallback_match;
   return same_template &&
          lhs->src_use_native_partial_elf == rhs->src_use_native_partial_elf &&
          lhs->src_cu_idx.index == rhs->src_cu_idx.index &&
